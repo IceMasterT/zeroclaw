@@ -94,7 +94,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -227,6 +227,31 @@ enum ChannelRuntimeCommand {
     ApproveTool(String),
     UnapproveTool(String),
     ListApprovals,
+    ShowQueue,
+    DropQueue(QueueDropTarget),
+    CancelInFlight(QueueDropTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDropTarget {
+    All,
+    Mine,
+    Id(u64),
+}
+
+#[derive(Debug, Clone)]
+struct QueuedDispatchTask {
+    id: u64,
+    scope_key: String,
+    channel: String,
+    sender: String,
+    preview: String,
+}
+
+#[derive(Debug, Default)]
+struct DispatchQueueControl {
+    pending: VecDeque<QueuedDispatchTask>,
+    dropped_task_ids: HashSet<u64>,
 }
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
@@ -317,6 +342,18 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn runtime_dispatch_queue_store() -> &'static Arc<tokio::sync::Mutex<DispatchQueueControl>> {
+    static STORE: OnceLock<Arc<tokio::sync::Mutex<DispatchQueueControl>>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(DispatchQueueControl::default())))
+}
+
+fn runtime_in_flight_store(
+) -> &'static Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>> {
+    static STORE: OnceLock<Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -362,6 +399,11 @@ struct ChannelRuntimeContext {
 #[derive(Clone)]
 struct InFlightSenderTaskState {
     task_id: u64,
+    scope_key: String,
+    channel: String,
+    sender: String,
+    preview: String,
+    started_at: Instant,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
 }
@@ -422,6 +464,10 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn interruption_scope_key_from_parts(channel: &str, reply_target: &str, sender: &str) -> String {
+    format!("{channel}_{reply_target}_{sender}")
 }
 
 fn should_prefix_sender_identity(msg: &traits::ChannelMessage) -> bool {
@@ -943,6 +989,41 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
+        "/queue" => {
+            let sub = args.first().map(|value| value.to_ascii_lowercase());
+            match sub.as_deref() {
+                None => Some(ChannelRuntimeCommand::ShowQueue),
+                Some("drop") => {
+                    let target = args.get(1).copied().unwrap_or("mine");
+                    if target.eq_ignore_ascii_case("all") {
+                        Some(ChannelRuntimeCommand::DropQueue(QueueDropTarget::All))
+                    } else if target.eq_ignore_ascii_case("mine") {
+                        Some(ChannelRuntimeCommand::DropQueue(QueueDropTarget::Mine))
+                    } else if let Ok(task_id) = target.parse::<u64>() {
+                        Some(ChannelRuntimeCommand::DropQueue(QueueDropTarget::Id(
+                            task_id,
+                        )))
+                    } else {
+                        None
+                    }
+                }
+                Some("cancel") => {
+                    let target = args.get(1).copied().unwrap_or("mine");
+                    if target.eq_ignore_ascii_case("all") {
+                        Some(ChannelRuntimeCommand::CancelInFlight(QueueDropTarget::All))
+                    } else if target.eq_ignore_ascii_case("mine") {
+                        Some(ChannelRuntimeCommand::CancelInFlight(QueueDropTarget::Mine))
+                    } else if let Ok(task_id) = target.parse::<u64>() {
+                        Some(ChannelRuntimeCommand::CancelInFlight(QueueDropTarget::Id(
+                            task_id,
+                        )))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
         // Provider/model switching remains limited to channels with session routing.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = args.first() {
@@ -2313,6 +2394,160 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+async fn build_queue_status_response() -> String {
+    let queue = runtime_dispatch_queue_store().lock().await;
+    let in_flight = runtime_in_flight_store().lock().await;
+
+    if queue.pending.is_empty() && in_flight.is_empty() {
+        return "Queued tasks: none\nIn-flight tasks: none".to_string();
+    }
+
+    let mut response = String::new();
+    if queue.pending.is_empty() {
+        response.push_str("Queued tasks: none\n");
+    } else {
+        let _ = writeln!(response, "Queued tasks: {}", queue.pending.len());
+        for task in queue.pending.iter().take(20) {
+            let _ = writeln!(
+                response,
+                "- #{} [{}:{}] {}",
+                task.id, task.channel, task.sender, task.preview
+            );
+        }
+        if queue.pending.len() > 20 {
+            let _ = writeln!(
+                response,
+                "... and {} more",
+                queue.pending.len().saturating_sub(20)
+            );
+        }
+    }
+
+    if in_flight.is_empty() {
+        response.push_str("In-flight tasks: none\n");
+    } else {
+        let _ = writeln!(response, "In-flight tasks: {}", in_flight.len());
+        for state in in_flight.values().take(20) {
+            let _ = writeln!(
+                response,
+                "- #{} [{}:{}] running {}ms | {}",
+                state.task_id,
+                state.channel,
+                state.sender,
+                state.started_at.elapsed().as_millis(),
+                state.preview
+            );
+        }
+        if in_flight.len() > 20 {
+            let _ = writeln!(
+                response,
+                "... and {} more in-flight",
+                in_flight.len().saturating_sub(20)
+            );
+        }
+    }
+
+    response.push_str(
+        "\nUse `/queue drop <id|mine|all>` for queued tasks, or `/queue cancel <id|mine|all>` for running tasks.",
+    );
+    response
+}
+
+async fn drop_queued_tasks(
+    sender: &str,
+    source_channel: &str,
+    reply_target: &str,
+    target: QueueDropTarget,
+) -> usize {
+    let mut queue = runtime_dispatch_queue_store().lock().await;
+    match target {
+        QueueDropTarget::All => {
+            let ids: Vec<u64> = queue.pending.iter().map(|task| task.id).collect();
+            for id in ids {
+                queue.dropped_task_ids.insert(id);
+            }
+            let removed = queue.pending.len();
+            queue.pending.clear();
+            removed
+        }
+        QueueDropTarget::Mine => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let removed_ids: Vec<u64> = queue
+                .pending
+                .iter()
+                .filter(|task| task.scope_key == scope_key)
+                .map(|task| task.id)
+                .collect();
+            for id in &removed_ids {
+                queue.dropped_task_ids.insert(*id);
+            }
+            queue.pending.retain(|task| task.scope_key != scope_key);
+            removed_ids.len()
+        }
+        QueueDropTarget::Id(task_id) => {
+            let exists = queue.pending.iter().any(|task| task.id == task_id);
+            if exists {
+                queue.pending.retain(|task| task.id != task_id);
+                queue.dropped_task_ids.insert(task_id);
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+async fn cancel_in_flight_tasks(
+    sender: &str,
+    source_channel: &str,
+    reply_target: &str,
+    target: QueueDropTarget,
+) -> usize {
+    let mut in_flight = runtime_in_flight_store().lock().await;
+    match target {
+        QueueDropTarget::All => {
+            let removed = in_flight.len();
+            for state in in_flight.values() {
+                state.cancellation.cancel();
+            }
+            in_flight.clear();
+            removed
+        }
+        QueueDropTarget::Mine => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let keys: Vec<String> = in_flight
+                .iter()
+                .filter(|(_, state)| state.scope_key == scope_key)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &keys {
+                if let Some(state) = in_flight.get(key) {
+                    state.cancellation.cancel();
+                }
+            }
+            for key in &keys {
+                in_flight.remove(key);
+            }
+            keys.len()
+        }
+        QueueDropTarget::Id(task_id) => {
+            let key = in_flight
+                .iter()
+                .find_map(|(key, state)| (state.task_id == task_id).then(|| key.clone()));
+            if let Some(key) = key {
+                if let Some(state) = in_flight.remove(&key) {
+                    state.cancellation.cancel();
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -2547,6 +2782,44 @@ async fn handle_runtime_command_if_needed(
                     "Model switched to `{model}` for provider `{}` in this sender session.",
                     current.provider
                 )
+            }
+        }
+        ChannelRuntimeCommand::ShowQueue => build_queue_status_response().await,
+        ChannelRuntimeCommand::DropQueue(target) => {
+            let dropped = drop_queued_tasks(sender, source_channel, reply_target, target).await;
+            match target {
+                QueueDropTarget::All => {
+                    format!("Dropped {dropped} queued task(s) across all senders.")
+                }
+                QueueDropTarget::Mine => {
+                    format!("Dropped {dropped} queued task(s) for your sender scope.")
+                }
+                QueueDropTarget::Id(task_id) => {
+                    if dropped == 0 {
+                        format!("No queued task found with id {task_id}.")
+                    } else {
+                        format!("Dropped queued task #{task_id}.")
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::CancelInFlight(target) => {
+            let cancelled =
+                cancel_in_flight_tasks(sender, source_channel, reply_target, target).await;
+            match target {
+                QueueDropTarget::All => {
+                    format!("Cancelled {cancelled} in-flight task(s) across all senders.")
+                }
+                QueueDropTarget::Mine => {
+                    format!("Cancelled {cancelled} in-flight task(s) for your sender scope.")
+                }
+                QueueDropTarget::Id(task_id) => {
+                    if cancelled == 0 {
+                        format!("No in-flight task found with id {task_id}.")
+                    } else {
+                        format!("Cancelled in-flight task #{task_id}.")
+                    }
+                }
             }
         }
         ChannelRuntimeCommand::NewSession => {
@@ -4557,42 +4830,83 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
+    let in_flight_by_sender = Arc::clone(runtime_in_flight_store());
+    let queue_store = Arc::clone(runtime_dispatch_queue_store());
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
+        let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+        let scope_key = interruption_scope_key(&msg);
+        {
+            let mut queue = queue_store.lock().await;
+            queue.pending.push_back(QueuedDispatchTask {
+                id: task_id,
+                scope_key: scope_key.clone(),
+                channel: msg.channel.clone(),
+                sender: msg.sender.clone(),
+                preview: truncate_with_ellipsis(&msg.content, 80),
+            });
+        }
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
-        let task_sequence = Arc::clone(&task_sequence);
+        let worker_queue = Arc::clone(&queue_store);
+        let worker_semaphore = Arc::clone(&semaphore);
         workers.spawn(async move {
-            let _permit = permit;
             let runtime_defaults = runtime_defaults_snapshot(worker_ctx.as_ref());
             let interrupt_enabled =
                 runtime_defaults.interrupt_on_new_message && msg.channel == "telegram";
             let sender_scope_key = interruption_scope_key(&msg);
+
+            let dropped_before_start = {
+                let mut queue = worker_queue.lock().await;
+                if queue.dropped_task_ids.remove(&task_id) {
+                    queue.pending.retain(|task| task.id != task_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if dropped_before_start {
+                return;
+            }
+
+            let _permit = match worker_semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+
+            let dropped_while_waiting = {
+                let mut queue = worker_queue.lock().await;
+                queue.pending.retain(|task| task.id != task_id);
+                queue.dropped_task_ids.remove(&task_id)
+            };
+            if dropped_while_waiting {
+                return;
+            }
+
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
-            let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+            let in_flight_key = if interrupt_enabled {
+                sender_scope_key.clone()
+            } else {
+                format!("{sender_scope_key}#{task_id}")
+            };
+            let in_flight_state = InFlightSenderTaskState {
+                task_id,
+                scope_key: sender_scope_key.clone(),
+                channel: msg.channel.clone(),
+                sender: msg.sender.clone(),
+                preview: truncate_with_ellipsis(&msg.content, 80),
+                started_at: Instant::now(),
+                cancellation: cancellation_token.clone(),
+                completion: Arc::clone(&completion),
+            };
 
             if interrupt_enabled {
                 let previous = {
                     let mut active = in_flight.lock().await;
-                    active.insert(
-                        sender_scope_key.clone(),
-                        InFlightSenderTaskState {
-                            task_id,
-                            cancellation: cancellation_token.clone(),
-                            completion: Arc::clone(&completion),
-                        },
-                    )
+                    active.insert(in_flight_key.clone(), in_flight_state.clone())
                 };
 
                 if let Some(previous) = previous {
@@ -4604,17 +4918,20 @@ async fn run_message_dispatch_loop(
                     previous.cancellation.cancel();
                     previous.completion.wait().await;
                 }
+            } else {
+                let mut active = in_flight.lock().await;
+                active.insert(in_flight_key.clone(), in_flight_state);
             }
 
             Box::pin(process_channel_message(worker_ctx, msg, cancellation_token)).await;
 
-            if interrupt_enabled {
+            {
                 let mut active = in_flight.lock().await;
                 if active
-                    .get(&sender_scope_key)
+                    .get(&in_flight_key)
                     .is_some_and(|state| state.task_id == task_id)
                 {
-                    active.remove(&sender_scope_key);
+                    active.remove(&in_flight_key);
                 }
             }
 
@@ -6263,6 +6580,26 @@ mod tests {
             Some(ChannelRuntimeCommand::ListApprovals)
         );
         assert_eq!(parse_runtime_command("slack", "/models"), None);
+    }
+
+    #[test]
+    fn parse_runtime_command_supports_queue_commands_on_all_channels() {
+        assert_eq!(
+            parse_runtime_command("slack", "/queue"),
+            Some(ChannelRuntimeCommand::ShowQueue)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue drop mine"),
+            Some(ChannelRuntimeCommand::DropQueue(QueueDropTarget::Mine))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue drop 42"),
+            Some(ChannelRuntimeCommand::DropQueue(QueueDropTarget::Id(42)))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue cancel all"),
+            Some(ChannelRuntimeCommand::CancelInFlight(QueueDropTarget::All))
+        );
     }
 
     #[test]
