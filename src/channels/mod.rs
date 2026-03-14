@@ -232,6 +232,7 @@ enum ChannelRuntimeCommand {
     CancelInFlight(QueueDropTarget),
     ShowStats(RuntimeStatusOutput),
     ShowHealth(RuntimeStatusOutput),
+    ShowProviderHealth(RuntimeStatusOutput),
     ShowDispatchMode,
     SetDispatchMode(DispatchClass),
     ShowPersona,
@@ -1643,7 +1644,18 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
         "/stats" => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowStats),
-        "/health" => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowHealth),
+        "/health" => {
+            if args
+                .first()
+                .copied()
+                .map_or(false, |a| a.eq_ignore_ascii_case("providers"))
+            {
+                parse_runtime_status_output(&args[1..])
+                    .map(ChannelRuntimeCommand::ShowProviderHealth)
+            } else {
+                parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowHealth)
+            }
+        }
         "/incidents" => {
             parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents)
         }
@@ -3282,9 +3294,20 @@ async fn build_runtime_health_response(
         "healthy"
     };
 
+    use crate::providers::breaker::BREAKER_REGISTRY;
+    let breaker_registry = BREAKER_REGISTRY.read().await;
+    let breaker_states = breaker_registry.get_all_states();
+    let breaker_config = breaker_registry.get_config();
+    let open_breakers: Vec<_> = breaker_states
+        .iter()
+        .filter(|(_, s)| s.failures >= breaker_config.failure_threshold)
+        .map(|(k, _)| k.clone())
+        .collect();
+    drop(breaker_registry);
+
     match output {
         RuntimeStatusOutput::Text => format!(
-            "Runtime health: {overall}\n- memory backend: {}\n- unhealthy channels: {}\n- queued: {}\n- in-flight: {}\n- soft in-flight limit: {}\n- queue pressure: {}\n- failure rate: {:.2}%\n- circuit pressure: {}\n- circuit state: {} (remaining {}s)",
+            "Runtime health: {overall}\n- memory backend: {}\n- unhealthy channels: {}\n- queued: {}\n- in-flight: {}\n- soft in-flight limit: {}\n- queue pressure: {}\n- failure rate: {:.2}%\n- circuit pressure: {}\n- circuit state: {} (remaining {}s)\n- open provider breakers: {}",
             if memory_ok { "ok" } else { "degraded" },
             if unhealthy_channels.is_empty() {
                 "none".to_string()
@@ -3299,6 +3322,11 @@ async fn build_runtime_health_response(
             if circuit_pressure { "elevated" } else { "normal" },
             circuit.state,
             circuit.remaining_secs,
+            if open_breakers.is_empty() {
+                "none".to_string()
+            } else {
+                open_breakers.join(", ")
+            },
         ),
         RuntimeStatusOutput::Json => serde_json::json!({
             "kind": "runtime_health",
@@ -3320,9 +3348,111 @@ async fn build_runtime_health_response(
                 "cooldown_secs": circuit.cooldown_secs,
                 "consecutive_failures": circuit.consecutive_failures,
                 "last_error": circuit.last_error,
+            },
+            "provider_breakers": {
+                "open": open_breakers,
+                "failure_threshold": breaker_config.failure_threshold,
+                "cooldown_secs": breaker_config.cooldown_secs,
             }
         })
         .to_string(),
+    }
+}
+
+async fn build_provider_health_response(output: RuntimeStatusOutput) -> String {
+    use crate::providers::breaker::BREAKER_REGISTRY;
+
+    let registry = BREAKER_REGISTRY.read().await;
+    let all_states = registry.get_all_states();
+    let config = registry.get_config();
+
+    match output {
+        RuntimeStatusOutput::Text => {
+            if all_states.is_empty() {
+                return "Provider breakers: no failures recorded".to_string();
+            }
+
+            let mut out = format!(
+                "Provider breakers (threshold: {}, cooldown: {}s):\n",
+                config.failure_threshold, config.cooldown_secs
+            );
+
+            for (provider, state) in &all_states {
+                let status = if state.failures >= config.failure_threshold {
+                    if state
+                        .cooldown_until
+                        .map_or(false, |until| until > std::time::Instant::now())
+                    {
+                        "OPEN"
+                    } else {
+                        "TRIPPED"
+                    }
+                } else {
+                    "closed"
+                };
+
+                let cooldown_info = state
+                    .cooldown_until
+                    .map(|until| {
+                        let remaining = until.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            String::new()
+                        } else {
+                            format!(" ({}s)", remaining.as_secs())
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let _ = writeln!(
+                    out,
+                    "- {}: {} failures, status: {}{}",
+                    provider, state.failures, status, cooldown_info
+                );
+            }
+
+            out
+        }
+        RuntimeStatusOutput::Json => {
+            let providers: serde_json::Value = all_states
+                .iter()
+                .map(|(name, state)| {
+                    let is_open = state.failures >= config.failure_threshold;
+                    let remaining_secs = state
+                        .cooldown_until
+                        .map(|until| {
+                            let remaining =
+                                until.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                0
+                            } else {
+                                remaining.as_secs()
+                            }
+                        })
+                        .unwrap_or(0);
+
+                    serde_json::json!({
+                        "name": name,
+                        "failures": state.failures,
+                        "total_trips": state.total_trips,
+                        "total_rejections": state.total_rejections,
+                        "is_open": is_open,
+                        "cooldown_remaining_secs": remaining_secs,
+                        "first_failure": state.first_failure.map(|t| t.elapsed().as_secs()),
+                        "last_failure": state.last_failure.map(|t| t.elapsed().as_secs()),
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "kind": "provider_health",
+                "config": {
+                    "failure_threshold": config.failure_threshold,
+                    "cooldown_secs": config.cooldown_secs,
+                },
+                "providers": providers,
+            })
+            .to_string()
+        }
     }
 }
 
@@ -3898,6 +4028,9 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowStats(output) => build_runtime_stats_response(output).await,
         ChannelRuntimeCommand::ShowHealth(output) => {
             build_runtime_health_response(ctx, output).await
+        }
+        ChannelRuntimeCommand::ShowProviderHealth(output) => {
+            build_provider_health_response(output).await
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::ShowDispatchMode => {
