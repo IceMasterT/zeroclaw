@@ -234,6 +234,10 @@ enum ChannelRuntimeCommand {
     ShowHealth(RuntimeStatusOutput),
     ShowDispatchMode,
     SetDispatchMode(DispatchClass),
+    ShowPersona,
+    SetPersonaProfile(PersonaProfile),
+    SetPersonaTrait(PersonaTrait, u8),
+    ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
@@ -249,6 +253,134 @@ enum RuntimeStatusOutput {
 enum DispatchClass {
     Interactive,
     Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaProfile {
+    Balanced,
+    Ops,
+    Mentor,
+    Forensic,
+    Creative,
+}
+
+impl PersonaProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Ops => "ops",
+            Self::Mentor => "mentor",
+            Self::Forensic => "forensic",
+            Self::Creative => "creative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaTrait {
+    Precision,
+    Warmth,
+    Boldness,
+    Brevity,
+    Curiosity,
+    Skepticism,
+}
+
+impl PersonaTrait {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Precision => "precision",
+            Self::Warmth => "warmth",
+            Self::Boldness => "boldness",
+            Self::Brevity => "brevity",
+            Self::Curiosity => "curiosity",
+            Self::Skepticism => "skepticism",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersonaVector {
+    precision: u8,
+    warmth: u8,
+    boldness: u8,
+    brevity: u8,
+    curiosity: u8,
+    skepticism: u8,
+}
+
+impl PersonaVector {
+    fn from_profile(profile: PersonaProfile) -> Self {
+        match profile {
+            PersonaProfile::Balanced => Self {
+                precision: 70,
+                warmth: 60,
+                boldness: 55,
+                brevity: 55,
+                curiosity: 60,
+                skepticism: 55,
+            },
+            PersonaProfile::Ops => Self {
+                precision: 85,
+                warmth: 45,
+                boldness: 65,
+                brevity: 75,
+                curiosity: 40,
+                skepticism: 80,
+            },
+            PersonaProfile::Mentor => Self {
+                precision: 70,
+                warmth: 85,
+                boldness: 50,
+                brevity: 45,
+                curiosity: 75,
+                skepticism: 45,
+            },
+            PersonaProfile::Forensic => Self {
+                precision: 90,
+                warmth: 40,
+                boldness: 55,
+                brevity: 60,
+                curiosity: 70,
+                skepticism: 90,
+            },
+            PersonaProfile::Creative => Self {
+                precision: 55,
+                warmth: 70,
+                boldness: 80,
+                brevity: 45,
+                curiosity: 90,
+                skepticism: 35,
+            },
+        }
+    }
+
+    fn set_trait(&mut self, key: PersonaTrait, value: u8) {
+        match key {
+            PersonaTrait::Precision => self.precision = value,
+            PersonaTrait::Warmth => self.warmth = value,
+            PersonaTrait::Boldness => self.boldness = value,
+            PersonaTrait::Brevity => self.brevity = value,
+            PersonaTrait::Curiosity => self.curiosity = value,
+            PersonaTrait::Skepticism => self.skepticism = value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersonaState {
+    profile: PersonaProfile,
+    vector: PersonaVector,
+}
+
+impl Default for PersonaState {
+    fn default() -> Self {
+        let profile = PersonaProfile::Balanced;
+        Self {
+            profile,
+            vector: PersonaVector::from_profile(profile),
+        }
+    }
 }
 
 impl DispatchClass {
@@ -495,6 +627,11 @@ fn runtime_dispatch_mode_store() -> &'static Mutex<HashMap<String, DispatchClass
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn runtime_persona_store() -> &'static Mutex<HashMap<String, PersonaState>> {
+    static STORE: OnceLock<Mutex<HashMap<String, PersonaState>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn runtime_circuit_guard_store() -> &'static Arc<RuntimeCircuitGuard> {
     static STORE: OnceLock<Arc<RuntimeCircuitGuard>> = OnceLock::new();
     STORE.get_or_init(|| Arc::new(RuntimeCircuitGuard::default()))
@@ -640,6 +777,74 @@ fn set_dispatch_mode(scope_key: &str, class: DispatchClass) {
     } else {
         modes.insert(scope_key.to_string(), class);
     }
+}
+
+fn get_persona_state(scope_key: &str) -> PersonaState {
+    runtime_persona_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(scope_key)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn set_persona_state(scope_key: &str, state: PersonaState) {
+    let mut personas = runtime_persona_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if state == PersonaState::default() {
+        personas.remove(scope_key);
+    } else {
+        personas.insert(scope_key.to_string(), state);
+    }
+}
+
+fn parse_persona_profile(value: &str) -> Option<PersonaProfile> {
+    if value.eq_ignore_ascii_case("balanced") {
+        Some(PersonaProfile::Balanced)
+    } else if value.eq_ignore_ascii_case("ops") {
+        Some(PersonaProfile::Ops)
+    } else if value.eq_ignore_ascii_case("mentor") {
+        Some(PersonaProfile::Mentor)
+    } else if value.eq_ignore_ascii_case("forensic") {
+        Some(PersonaProfile::Forensic)
+    } else if value.eq_ignore_ascii_case("creative") {
+        Some(PersonaProfile::Creative)
+    } else {
+        None
+    }
+}
+
+fn parse_persona_trait(value: &str) -> Option<PersonaTrait> {
+    if value.eq_ignore_ascii_case("precision") {
+        Some(PersonaTrait::Precision)
+    } else if value.eq_ignore_ascii_case("warmth") {
+        Some(PersonaTrait::Warmth)
+    } else if value.eq_ignore_ascii_case("boldness") {
+        Some(PersonaTrait::Boldness)
+    } else if value.eq_ignore_ascii_case("brevity") {
+        Some(PersonaTrait::Brevity)
+    } else if value.eq_ignore_ascii_case("curiosity") {
+        Some(PersonaTrait::Curiosity)
+    } else if value.eq_ignore_ascii_case("skepticism") {
+        Some(PersonaTrait::Skepticism)
+    } else {
+        None
+    }
+}
+
+fn build_persona_instruction(state: PersonaState) -> String {
+    let v = state.vector;
+    format!(
+        "\n\nPersonality profile: {}.\nPersonality vector (0-100): precision={}, warmth={}, boldness={}, brevity={}, curiosity={}, skepticism={}.\nBehavioral contract: keep identity stable, prioritize these vector signals when choosing tone/detail/assertiveness, and remain deterministic for operational instructions.",
+        state.profile.as_str(),
+        v.precision,
+        v.warmth,
+        v.boldness,
+        v.brevity,
+        v.curiosity,
+        v.skepticism
+    )
 }
 
 fn record_runtime_incident(kind: &str, detail: impl Into<String>) {
@@ -1255,6 +1460,28 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             Some(raw) if raw.eq_ignore_ascii_case("background") => Some(
                 ChannelRuntimeCommand::SetDispatchMode(DispatchClass::Background),
             ),
+            _ => None,
+        },
+        "/persona" => match args.first().copied() {
+            None => Some(ChannelRuntimeCommand::ShowPersona),
+            Some(raw) if raw.eq_ignore_ascii_case("reset") => {
+                Some(ChannelRuntimeCommand::ResetPersona)
+            }
+            Some(kind) if kind.eq_ignore_ascii_case("profile") => {
+                let profile_raw = args.get(1)?;
+                parse_persona_profile(profile_raw).map(ChannelRuntimeCommand::SetPersonaProfile)
+            }
+            Some(kind) if kind.eq_ignore_ascii_case("trait") => {
+                let trait_raw = args.get(1)?;
+                let value_raw = args.get(2)?;
+                let trait_key = parse_persona_trait(trait_raw)?;
+                let value = value_raw.parse::<u8>().ok()?;
+                if value > 100 {
+                    None
+                } else {
+                    Some(ChannelRuntimeCommand::SetPersonaTrait(trait_key, value))
+                }
+            }
             _ => None,
         },
         "/queue" => {
@@ -3494,6 +3721,48 @@ async fn handle_runtime_command_if_needed(
                 class.as_str()
             )
         }
+        ChannelRuntimeCommand::ShowPersona => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let state = get_persona_state(&scope_key);
+            format!(
+                "Persona\n- profile: {}\n- precision: {}\n- warmth: {}\n- boldness: {}\n- brevity: {}\n- curiosity: {}\n- skepticism: {}\n\nUse `/persona profile <balanced|ops|mentor|forensic|creative>`, `/persona trait <name> <0-100>`, or `/persona reset`.",
+                state.profile.as_str(),
+                state.vector.precision,
+                state.vector.warmth,
+                state.vector.boldness,
+                state.vector.brevity,
+                state.vector.curiosity,
+                state.vector.skepticism,
+            )
+        }
+        ChannelRuntimeCommand::SetPersonaProfile(profile) => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let state = PersonaState {
+                profile,
+                vector: PersonaVector::from_profile(profile),
+            };
+            set_persona_state(&scope_key, state);
+            format!(
+                "Persona profile switched to `{}` for your sender scope.",
+                profile.as_str()
+            )
+        }
+        ChannelRuntimeCommand::SetPersonaTrait(trait_key, value) => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let mut state = get_persona_state(&scope_key);
+            state.vector.set_trait(trait_key, value);
+            set_persona_state(&scope_key, state);
+            format!(
+                "Persona trait `{}` set to {} for your sender scope.",
+                trait_key.as_str(),
+                value
+            )
+        }
+        ChannelRuntimeCommand::ResetPersona => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            set_persona_state(&scope_key, PersonaState::default());
+            "Persona reset to default balanced profile for your sender scope.".to_string()
+        }
         ChannelRuntimeCommand::ShowQueuePolicy => build_queue_policy_response(),
         ChannelRuntimeCommand::SetQueuePolicy(setting) => set_queue_policy(setting),
         ChannelRuntimeCommand::NewSession => {
@@ -4853,6 +5122,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         &msg.reply_target,
         expose_internal_tool_details,
     );
+    let sender_scope_key = interruption_scope_key(&msg);
+    system_prompt.push_str(&build_persona_instruction(get_persona_state(
+        &sender_scope_key,
+    )));
     system_prompt.push_str(&build_runtime_tool_visibility_prompt(
         ctx.tools_registry.as_ref(),
         &excluded_tools_snapshot,
@@ -7384,6 +7657,27 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_runtime_command("slack", "/persona"),
+            Some(ChannelRuntimeCommand::ShowPersona)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/persona profile mentor"),
+            Some(ChannelRuntimeCommand::SetPersonaProfile(
+                PersonaProfile::Mentor
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/persona trait skepticism 88"),
+            Some(ChannelRuntimeCommand::SetPersonaTrait(
+                PersonaTrait::Skepticism,
+                88
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/persona reset"),
+            Some(ChannelRuntimeCommand::ResetPersona)
+        );
+        assert_eq!(
             parse_runtime_command("slack", "/queue policy"),
             Some(ChannelRuntimeCommand::ShowQueuePolicy)
         );
@@ -9249,6 +9543,113 @@ BTC is currently around $65,000 based on latest tool output."#
 
         set_dispatch_mode("telegram_chat-1_alice", DispatchClass::Interactive);
 
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_persona_commands_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-persona-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/persona profile mentor".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-persona-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/persona trait skepticism 77".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-persona-3".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/persona".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 3,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 3);
+        assert!(sent[0].contains("Persona profile switched to `mentor`"));
+        assert!(sent[1].contains("Persona trait `skepticism` set to 77"));
+        assert!(sent[2].contains("profile: mentor"));
+        assert!(sent[2].contains("skepticism: 77"));
+        drop(sent);
+
+        set_persona_state("telegram_chat-1_alice", PersonaState::default());
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
