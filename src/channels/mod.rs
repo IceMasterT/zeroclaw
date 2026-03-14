@@ -93,12 +93,12 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -230,6 +230,40 @@ enum ChannelRuntimeCommand {
     ShowQueue,
     DropQueue(QueueDropTarget),
     CancelInFlight(QueueDropTarget),
+    ShowStats(RuntimeStatusOutput),
+    ShowHealth(RuntimeStatusOutput),
+    ShowDispatchMode,
+    SetDispatchMode(DispatchClass),
+    ShowIncidents(RuntimeStatusOutput),
+    ShowQueuePolicy,
+    SetQueuePolicy(QueuePolicySetting),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeStatusOutput {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchClass {
+    Interactive,
+    Background,
+}
+
+impl DispatchClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePolicySetting {
+    InFlightLimit(usize),
+    Adaptive(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +279,7 @@ struct QueuedDispatchTask {
     scope_key: String,
     channel: String,
     sender: String,
+    class: DispatchClass,
     preview: String,
 }
 
@@ -252,6 +287,97 @@ struct QueuedDispatchTask {
 struct DispatchQueueControl {
     pending: VecDeque<QueuedDispatchTask>,
     dropped_task_ids: HashSet<u64>,
+}
+
+#[derive(Debug)]
+struct RuntimeDispatchStats {
+    started_at: Instant,
+    received_messages: AtomicU64,
+    completed_messages: AtomicU64,
+    failed_messages: AtomicU64,
+    dropped_queued_messages: AtomicU64,
+    cancelled_in_flight_messages: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeIncident {
+    ts_unix: u64,
+    kind: String,
+    detail: String,
+}
+
+#[derive(Debug)]
+struct RuntimeCircuitGuard {
+    failure_threshold: u64,
+    cooldown_secs: u64,
+    consecutive_failures: AtomicU64,
+    opened_until: Mutex<Option<Instant>>,
+    last_error: Mutex<Option<String>>,
+}
+
+impl Default for RuntimeCircuitGuard {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            cooldown_secs: 30,
+            consecutive_failures: AtomicU64::new(0),
+            opened_until: Mutex::new(None),
+            last_error: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeCircuitSnapshot {
+    state: &'static str,
+    remaining_secs: u64,
+    failure_threshold: u64,
+    cooldown_secs: u64,
+    consecutive_failures: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct RuntimeQueuePolicy {
+    hard_in_flight_limit: AtomicUsize,
+    soft_in_flight_limit: AtomicUsize,
+    adaptive_enabled: AtomicBool,
+}
+
+impl Default for RuntimeQueuePolicy {
+    fn default() -> Self {
+        Self {
+            hard_in_flight_limit: AtomicUsize::new(4),
+            soft_in_flight_limit: AtomicUsize::new(4),
+            adaptive_enabled: AtomicBool::new(false),
+        }
+    }
+}
+
+impl RuntimeQueuePolicy {
+    fn hard_limit(&self) -> usize {
+        self.hard_in_flight_limit.load(Ordering::Relaxed).max(1)
+    }
+
+    fn soft_limit(&self) -> usize {
+        let hard = self.hard_limit();
+        self.soft_in_flight_limit
+            .load(Ordering::Relaxed)
+            .clamp(1, hard)
+    }
+}
+
+impl Default for RuntimeDispatchStats {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            received_messages: AtomicU64::new(0),
+            completed_messages: AtomicU64::new(0),
+            failed_messages: AtomicU64::new(0),
+            dropped_queued_messages: AtomicU64::new(0),
+            cancelled_in_flight_messages: AtomicU64::new(0),
+        }
+    }
 }
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
@@ -354,6 +480,31 @@ fn runtime_in_flight_store(
     STORE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
 }
 
+fn runtime_dispatch_stats_store() -> &'static Arc<RuntimeDispatchStats> {
+    static STORE: OnceLock<Arc<RuntimeDispatchStats>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(RuntimeDispatchStats::default()))
+}
+
+fn runtime_queue_policy_store() -> &'static Arc<RuntimeQueuePolicy> {
+    static STORE: OnceLock<Arc<RuntimeQueuePolicy>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(RuntimeQueuePolicy::default()))
+}
+
+fn runtime_dispatch_mode_store() -> &'static Mutex<HashMap<String, DispatchClass>> {
+    static STORE: OnceLock<Mutex<HashMap<String, DispatchClass>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn runtime_circuit_guard_store() -> &'static Arc<RuntimeCircuitGuard> {
+    static STORE: OnceLock<Arc<RuntimeCircuitGuard>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(RuntimeCircuitGuard::default()))
+}
+
+fn runtime_incident_store() -> &'static Mutex<VecDeque<RuntimeIncident>> {
+    static STORE: OnceLock<Mutex<VecDeque<RuntimeIncident>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(128)))
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -402,6 +553,7 @@ struct InFlightSenderTaskState {
     scope_key: String,
     channel: String,
     sender: String,
+    class: DispatchClass,
     preview: String,
     started_at: Instant,
     cancellation: CancellationToken,
@@ -468,6 +620,98 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key_from_parts(channel: &str, reply_target: &str, sender: &str) -> String {
     format!("{channel}_{reply_target}_{sender}")
+}
+
+fn get_dispatch_mode(scope_key: &str) -> DispatchClass {
+    runtime_dispatch_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(scope_key)
+        .copied()
+        .unwrap_or(DispatchClass::Interactive)
+}
+
+fn set_dispatch_mode(scope_key: &str, class: DispatchClass) {
+    let mut modes = runtime_dispatch_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if class == DispatchClass::Interactive {
+        modes.remove(scope_key);
+    } else {
+        modes.insert(scope_key.to_string(), class);
+    }
+}
+
+fn record_runtime_incident(kind: &str, detail: impl Into<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut incidents = runtime_incident_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if incidents.len() >= 100 {
+        incidents.pop_front();
+    }
+    incidents.push_back(RuntimeIncident {
+        ts_unix: now,
+        kind: kind.to_string(),
+        detail: detail.into(),
+    });
+}
+
+fn record_runtime_success() {
+    let guard = runtime_circuit_guard_store();
+    guard.consecutive_failures.store(0, Ordering::Relaxed);
+    let mut opened = guard.opened_until.lock().unwrap_or_else(|e| e.into_inner());
+    *opened = None;
+}
+
+fn record_runtime_failure(detail: impl AsRef<str>) {
+    let detail = detail.as_ref();
+    record_runtime_incident("failure", detail);
+
+    let guard = runtime_circuit_guard_store();
+    let next = guard.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut last_error = guard.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        *last_error = Some(truncate_with_ellipsis(detail, 160));
+    }
+    if next >= guard.failure_threshold {
+        let mut opened = guard.opened_until.lock().unwrap_or_else(|e| e.into_inner());
+        *opened = Some(Instant::now() + Duration::from_secs(guard.cooldown_secs));
+        guard.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+}
+
+fn runtime_circuit_snapshot() -> RuntimeCircuitSnapshot {
+    let guard = runtime_circuit_guard_store();
+    let mut opened = guard.opened_until.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = "closed";
+    let mut remaining_secs = 0;
+
+    if let Some(until) = *opened {
+        if until > Instant::now() {
+            state = "open";
+            remaining_secs = until.duration_since(Instant::now()).as_secs();
+        } else {
+            *opened = None;
+        }
+    }
+
+    let last_error = guard
+        .last_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    RuntimeCircuitSnapshot {
+        state,
+        remaining_secs,
+        failure_threshold: guard.failure_threshold,
+        cooldown_secs: guard.cooldown_secs,
+        consecutive_failures: guard.consecutive_failures.load(Ordering::Relaxed),
+        last_error,
+    }
 }
 
 fn should_prefix_sender_identity(msg: &traits::ChannelMessage) -> bool {
@@ -961,6 +1205,15 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
+fn parse_runtime_status_output(args: &[&str]) -> Option<RuntimeStatusOutput> {
+    match args.first().copied() {
+        None => Some(RuntimeStatusOutput::Text),
+        Some(raw) if raw.eq_ignore_ascii_case("text") => Some(RuntimeStatusOutput::Text),
+        Some(raw) if raw.eq_ignore_ascii_case("json") => Some(RuntimeStatusOutput::Json),
+        Some(_) => None,
+    }
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
@@ -989,10 +1242,61 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
+        "/stats" => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowStats),
+        "/health" => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowHealth),
+        "/incidents" => {
+            parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents)
+        }
+        "/mode" => match args.first().copied() {
+            None => Some(ChannelRuntimeCommand::ShowDispatchMode),
+            Some(raw) if raw.eq_ignore_ascii_case("interactive") => Some(
+                ChannelRuntimeCommand::SetDispatchMode(DispatchClass::Interactive),
+            ),
+            Some(raw) if raw.eq_ignore_ascii_case("background") => Some(
+                ChannelRuntimeCommand::SetDispatchMode(DispatchClass::Background),
+            ),
+            _ => None,
+        },
         "/queue" => {
             let sub = args.first().map(|value| value.to_ascii_lowercase());
             match sub.as_deref() {
                 None => Some(ChannelRuntimeCommand::ShowQueue),
+                Some("policy") => {
+                    if args.len() == 1 {
+                        Some(ChannelRuntimeCommand::ShowQueuePolicy)
+                    } else {
+                        match args.get(1).copied().map(|value| value.to_ascii_lowercase()) {
+                            Some(kind) if kind == "in-flight" => {
+                                let raw_limit = args.get(2)?;
+                                let parsed = raw_limit.parse::<usize>().ok()?;
+                                Some(ChannelRuntimeCommand::SetQueuePolicy(
+                                    QueuePolicySetting::InFlightLimit(parsed),
+                                ))
+                            }
+                            Some(kind) if kind == "adaptive" => {
+                                let raw = args.get(2)?;
+                                let enabled = if raw.eq_ignore_ascii_case("on")
+                                    || raw.eq_ignore_ascii_case("true")
+                                    || raw.eq_ignore_ascii_case("1")
+                                {
+                                    true
+                                } else if raw.eq_ignore_ascii_case("off")
+                                    || raw.eq_ignore_ascii_case("false")
+                                    || raw.eq_ignore_ascii_case("0")
+                                {
+                                    false
+                                } else {
+                                    return None;
+                                };
+
+                                Some(ChannelRuntimeCommand::SetQueuePolicy(
+                                    QueuePolicySetting::Adaptive(enabled),
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }
+                }
                 Some("drop") => {
                     let target = args.get(1).copied().unwrap_or("mine");
                     if target.eq_ignore_ascii_case("all") {
@@ -2410,8 +2714,12 @@ async fn build_queue_status_response() -> String {
         for task in queue.pending.iter().take(20) {
             let _ = writeln!(
                 response,
-                "- #{} [{}:{}] {}",
-                task.id, task.channel, task.sender, task.preview
+                "- #{} [{}:{}:{}] {}",
+                task.id,
+                task.channel,
+                task.sender,
+                task.class.as_str(),
+                task.preview
             );
         }
         if queue.pending.len() > 20 {
@@ -2430,10 +2738,11 @@ async fn build_queue_status_response() -> String {
         for state in in_flight.values().take(20) {
             let _ = writeln!(
                 response,
-                "- #{} [{}:{}] running {}ms | {}",
+                "- #{} [{}:{}:{}] running {}ms | {}",
                 state.task_id,
                 state.channel,
                 state.sender,
+                state.class.as_str(),
                 state.started_at.elapsed().as_millis(),
                 state.preview
             );
@@ -2453,6 +2762,325 @@ async fn build_queue_status_response() -> String {
     response
 }
 
+async fn build_runtime_stats_response(output: RuntimeStatusOutput) -> String {
+    let queue = runtime_dispatch_queue_store().lock().await;
+    let in_flight = runtime_in_flight_store().lock().await;
+    let stats = runtime_dispatch_stats_store();
+
+    let uptime_secs = stats.started_at.elapsed().as_secs();
+    let received = stats.received_messages.load(Ordering::Relaxed);
+    let completed = stats.completed_messages.load(Ordering::Relaxed);
+    let failed = stats.failed_messages.load(Ordering::Relaxed);
+    let dropped = stats.dropped_queued_messages.load(Ordering::Relaxed);
+    let cancelled = stats.cancelled_in_flight_messages.load(Ordering::Relaxed);
+    let failure_rate = if completed == 0 {
+        0.0
+    } else {
+        failed as f64 / completed as f64
+    };
+    let policy = runtime_queue_policy_store();
+
+    let adaptive = policy.adaptive_enabled.load(Ordering::Relaxed);
+
+    match output {
+        RuntimeStatusOutput::Text => format!(
+            "Runtime stats\n- uptime: {uptime_secs}s\n- queued: {}\n- in-flight: {}\n- soft in-flight limit: {}\n- hard in-flight limit: {}\n- adaptive queue policy: {}\n- received: {received}\n- completed: {completed}\n- failed: {failed}\n- failure rate: {:.2}%\n- dropped queued: {dropped}\n- cancelled in-flight: {cancelled}",
+            queue.pending.len(),
+            in_flight.len(),
+            policy.soft_limit(),
+            policy.hard_limit(),
+            if adaptive { "on" } else { "off" },
+            failure_rate * 100.0,
+        ),
+        RuntimeStatusOutput::Json => serde_json::json!({
+            "kind": "runtime_stats",
+            "uptime_secs": uptime_secs,
+            "queue": {
+                "queued": queue.pending.len(),
+                "in_flight": in_flight.len(),
+                "soft_in_flight_limit": policy.soft_limit(),
+                "hard_in_flight_limit": policy.hard_limit(),
+                "adaptive": adaptive,
+            },
+            "messages": {
+                "received": received,
+                "completed": completed,
+                "failed": failed,
+                "failure_rate": failure_rate,
+                "dropped_queued": dropped,
+                "cancelled_in_flight": cancelled,
+            }
+        })
+        .to_string(),
+    }
+}
+
+async fn build_runtime_health_response(
+    ctx: &ChannelRuntimeContext,
+    output: RuntimeStatusOutput,
+) -> String {
+    let queue = runtime_dispatch_queue_store().lock().await;
+    let in_flight = runtime_in_flight_store().lock().await;
+    let stats = runtime_dispatch_stats_store();
+    let policy = runtime_queue_policy_store();
+
+    let completed = stats.completed_messages.load(Ordering::Relaxed);
+    let failed = stats.failed_messages.load(Ordering::Relaxed);
+    let failure_rate = if completed == 0 {
+        0.0
+    } else {
+        failed as f64 / completed as f64
+    };
+
+    let queue_pressure = queue.pending.len() > policy.soft_limit().saturating_mul(2);
+    let circuit_pressure = failure_rate >= 0.25;
+    let circuit = runtime_circuit_snapshot();
+    let memory_ok = tokio::time::timeout(Duration::from_secs(3), ctx.memory.health_check())
+        .await
+        .unwrap_or(false);
+
+    let mut unhealthy_channels = Vec::new();
+    for (name, channel) in ctx.channels_by_name.iter() {
+        let ok = tokio::time::timeout(Duration::from_secs(3), channel.health_check())
+            .await
+            .unwrap_or(false);
+        if !ok {
+            unhealthy_channels.push(name.clone());
+        }
+    }
+
+    let overall = if !memory_ok
+        || !unhealthy_channels.is_empty()
+        || queue_pressure
+        || circuit_pressure
+        || circuit.state == "open"
+    {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    match output {
+        RuntimeStatusOutput::Text => format!(
+            "Runtime health: {overall}\n- memory backend: {}\n- unhealthy channels: {}\n- queued: {}\n- in-flight: {}\n- soft in-flight limit: {}\n- queue pressure: {}\n- failure rate: {:.2}%\n- circuit pressure: {}\n- circuit state: {} (remaining {}s)",
+            if memory_ok { "ok" } else { "degraded" },
+            if unhealthy_channels.is_empty() {
+                "none".to_string()
+            } else {
+                unhealthy_channels.join(", ")
+            },
+            queue.pending.len(),
+            in_flight.len(),
+            policy.soft_limit(),
+            if queue_pressure { "high" } else { "normal" },
+            failure_rate * 100.0,
+            if circuit_pressure { "elevated" } else { "normal" },
+            circuit.state,
+            circuit.remaining_secs,
+        ),
+        RuntimeStatusOutput::Json => serde_json::json!({
+            "kind": "runtime_health",
+            "overall": overall,
+            "memory_backend": if memory_ok { "ok" } else { "degraded" },
+            "unhealthy_channels": unhealthy_channels,
+            "queue": {
+                "queued": queue.pending.len(),
+                "in_flight": in_flight.len(),
+                "soft_in_flight_limit": policy.soft_limit(),
+                "queue_pressure": if queue_pressure { "high" } else { "normal" },
+            },
+            "circuit": {
+                "failure_rate": failure_rate,
+                "pressure": if circuit_pressure { "elevated" } else { "normal" },
+                "state": circuit.state,
+                "remaining_secs": circuit.remaining_secs,
+                "failure_threshold": circuit.failure_threshold,
+                "cooldown_secs": circuit.cooldown_secs,
+                "consecutive_failures": circuit.consecutive_failures,
+                "last_error": circuit.last_error,
+            }
+        })
+        .to_string(),
+    }
+}
+
+fn build_runtime_incidents_response(output: RuntimeStatusOutput) -> String {
+    let incidents = runtime_incident_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match output {
+        RuntimeStatusOutput::Text => {
+            if incidents.is_empty() {
+                return "Runtime incidents: none".to_string();
+            }
+            let mut out = format!("Runtime incidents: {}\n", incidents.len());
+            for incident in incidents.iter().rev().take(20) {
+                let _ = writeln!(
+                    out,
+                    "- [{}] {}: {}",
+                    incident.ts_unix, incident.kind, incident.detail
+                );
+            }
+            out
+        }
+        RuntimeStatusOutput::Json => serde_json::json!({
+            "kind": "runtime_incidents",
+            "count": incidents.len(),
+            "items": incidents,
+        })
+        .to_string(),
+    }
+}
+
+fn build_queue_policy_response() -> String {
+    let policy = runtime_queue_policy_store();
+    format!(
+        "Queue policy\n- soft in-flight limit: {}\n- hard in-flight limit: {}\n- adaptive: {}\n\nSet with `/queue policy in-flight <n>` or `/queue policy adaptive <on|off>`.",
+        policy.soft_limit(),
+        policy.hard_limit(),
+        if policy.adaptive_enabled.load(Ordering::Relaxed) {
+            "on"
+        } else {
+            "off"
+        }
+    )
+}
+
+fn set_queue_policy(setting: QueuePolicySetting) -> String {
+    let policy = runtime_queue_policy_store();
+    match setting {
+        QueuePolicySetting::InFlightLimit(limit) => {
+            let hard = policy.hard_limit();
+            let clamped = limit.clamp(1, hard);
+            policy
+                .soft_in_flight_limit
+                .store(clamped, Ordering::Relaxed);
+            runtime_trace::record_event(
+                "channel_queue_policy_updated",
+                Some("runtime"),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("queue soft in-flight limit updated"),
+                serde_json::json!({
+                    "soft_in_flight_limit": clamped,
+                    "hard_in_flight_limit": hard,
+                }),
+            );
+            format!(
+                "Queue policy updated: soft in-flight limit is now {clamped} (hard max {hard})."
+            )
+        }
+        QueuePolicySetting::Adaptive(enabled) => {
+            policy.adaptive_enabled.store(enabled, Ordering::Relaxed);
+            runtime_trace::record_event(
+                "channel_queue_policy_updated",
+                Some("runtime"),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("queue adaptive mode updated"),
+                serde_json::json!({
+                    "adaptive_enabled": enabled,
+                }),
+            );
+            format!(
+                "Queue policy updated: adaptive mode is now {}.",
+                if enabled { "on" } else { "off" }
+            )
+        }
+    }
+}
+
+fn maybe_adjust_queue_policy_adaptive(queue_len: usize, in_flight_len: usize) {
+    let policy = runtime_queue_policy_store();
+    if !policy.adaptive_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let hard = policy.hard_limit();
+    let current = policy.soft_limit();
+    let stats = runtime_dispatch_stats_store();
+    let completed = stats.completed_messages.load(Ordering::Relaxed);
+    let failed = stats.failed_messages.load(Ordering::Relaxed);
+    let failure_rate = if completed == 0 {
+        0.0
+    } else {
+        failed as f64 / completed as f64
+    };
+
+    if failure_rate >= 0.25 && current > 1 {
+        let next = current - 1;
+        policy.soft_in_flight_limit.store(next, Ordering::Relaxed);
+        runtime_trace::record_event(
+            "channel_queue_policy_auto_tuned",
+            Some("runtime"),
+            None,
+            None,
+            None,
+            Some(true),
+            Some("adaptive queue policy lowered soft in-flight limit due to error pressure"),
+            serde_json::json!({
+                "from": current,
+                "to": next,
+                "queue_len": queue_len,
+                "in_flight_len": in_flight_len,
+                "failure_rate": failure_rate,
+            }),
+        );
+        return;
+    }
+
+    if queue_len > current.saturating_mul(2) && current < hard {
+        let next = (current + 1).min(hard);
+        policy.soft_in_flight_limit.store(next, Ordering::Relaxed);
+        runtime_trace::record_event(
+            "channel_queue_policy_auto_tuned",
+            Some("runtime"),
+            None,
+            None,
+            None,
+            Some(true),
+            Some("adaptive queue policy raised soft in-flight limit due to queue pressure"),
+            serde_json::json!({
+                "from": current,
+                "to": next,
+                "queue_len": queue_len,
+                "in_flight_len": in_flight_len,
+                "failure_rate": failure_rate,
+            }),
+        );
+        return;
+    }
+
+    if queue_len == 0 && in_flight_len + 1 < current && current > 1 {
+        let next = current - 1;
+        policy.soft_in_flight_limit.store(next, Ordering::Relaxed);
+        runtime_trace::record_event(
+            "channel_queue_policy_auto_tuned",
+            Some("runtime"),
+            None,
+            None,
+            None,
+            Some(true),
+            Some("adaptive queue policy lowered soft in-flight limit due to idle queue"),
+            serde_json::json!({
+                "from": current,
+                "to": next,
+                "queue_len": queue_len,
+                "in_flight_len": in_flight_len,
+                "failure_rate": failure_rate,
+            }),
+        );
+    }
+}
+
 async fn drop_queued_tasks(
     sender: &str,
     source_channel: &str,
@@ -2460,7 +3088,7 @@ async fn drop_queued_tasks(
     target: QueueDropTarget,
 ) -> usize {
     let mut queue = runtime_dispatch_queue_store().lock().await;
-    match target {
+    let removed = match target {
         QueueDropTarget::All => {
             let ids: Vec<u64> = queue.pending.iter().map(|task| task.id).collect();
             for id in ids {
@@ -2494,7 +3122,17 @@ async fn drop_queued_tasks(
                 0
             }
         }
+    };
+
+    runtime_dispatch_stats_store()
+        .dropped_queued_messages
+        .fetch_add(removed as u64, Ordering::Relaxed);
+
+    if removed > 0 {
+        record_runtime_incident("queue_drop", format!("dropped {removed} queued task(s)"));
     }
+
+    removed
 }
 
 async fn cancel_in_flight_tasks(
@@ -2504,7 +3142,7 @@ async fn cancel_in_flight_tasks(
     target: QueueDropTarget,
 ) -> usize {
     let mut in_flight = runtime_in_flight_store().lock().await;
-    match target {
+    let cancelled = match target {
         QueueDropTarget::All => {
             let removed = in_flight.len();
             for state in in_flight.values() {
@@ -2545,7 +3183,20 @@ async fn cancel_in_flight_tasks(
                 0
             }
         }
+    };
+
+    runtime_dispatch_stats_store()
+        .cancelled_in_flight_messages
+        .fetch_add(cancelled as u64, Ordering::Relaxed);
+
+    if cancelled > 0 {
+        record_runtime_incident(
+            "in_flight_cancel",
+            format!("cancelled {cancelled} in-flight task(s)"),
+        );
     }
+
+    cancelled
 }
 
 async fn handle_runtime_command_if_needed(
@@ -2822,6 +3473,29 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         }
+        ChannelRuntimeCommand::ShowStats(output) => build_runtime_stats_response(output).await,
+        ChannelRuntimeCommand::ShowHealth(output) => {
+            build_runtime_health_response(ctx, output).await
+        }
+        ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
+        ChannelRuntimeCommand::ShowDispatchMode => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let mode = get_dispatch_mode(&scope_key);
+            format!(
+                "Dispatch mode: `{}`\nUse `/mode interactive` or `/mode background` to change how your new requests are scheduled.",
+                mode.as_str()
+            )
+        }
+        ChannelRuntimeCommand::SetDispatchMode(class) => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            set_dispatch_mode(&scope_key, class);
+            format!(
+                "Dispatch mode updated to `{}` for your sender scope.",
+                class.as_str()
+            )
+        }
+        ChannelRuntimeCommand::ShowQueuePolicy => build_queue_policy_response(),
+        ChannelRuntimeCommand::SetQueuePolicy(setting) => set_queue_policy(setting),
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
@@ -4598,10 +5272,15 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
+            record_runtime_success();
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
             {
+                record_runtime_incident(
+                    "cancelled",
+                    format!("{}:{} cancelled by newer request", msg.channel, msg.sender),
+                );
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
@@ -4628,6 +5307,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
+                runtime_dispatch_stats_store()
+                    .failed_messages
+                    .fetch_add(1, Ordering::Relaxed);
+                record_runtime_failure("context window exceeded");
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
@@ -4668,6 +5351,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     }
                 }
             } else if is_tool_iteration_limit_error(&e) {
+                runtime_dispatch_stats_store()
+                    .failed_messages
+                    .fetch_add(1, Ordering::Relaxed);
+                record_runtime_failure("tool iteration limit reached");
                 let limit = runtime_defaults.max_tool_iterations.max(1);
                 let pause_text = format!(
                     "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
@@ -4708,6 +5395,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     }
                 }
             } else {
+                runtime_dispatch_stats_store()
+                    .failed_messages
+                    .fetch_add(1, Ordering::Relaxed);
+                record_runtime_failure(providers::sanitize_api_error(&e.to_string()));
                 eprintln!(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
@@ -4762,6 +5453,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             }
         }
         LlmExecutionResult::Completed(Err(_)) => {
+            runtime_dispatch_stats_store()
+                .failed_messages
+                .fetch_add(1, Ordering::Relaxed);
+            record_runtime_failure("model response timed out");
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs,
@@ -4832,26 +5527,40 @@ async fn run_message_dispatch_loop(
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::clone(runtime_in_flight_store());
     let queue_store = Arc::clone(runtime_dispatch_queue_store());
+    let stats = Arc::clone(runtime_dispatch_stats_store());
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        stats.received_messages.fetch_add(1, Ordering::Relaxed);
         let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
         let scope_key = interruption_scope_key(&msg);
-        {
+        let dispatch_class = if parse_runtime_command(&msg.channel, &msg.content).is_some() {
+            DispatchClass::Interactive
+        } else {
+            get_dispatch_mode(&scope_key)
+        };
+        let queue_len_after_enqueue = {
             let mut queue = queue_store.lock().await;
             queue.pending.push_back(QueuedDispatchTask {
                 id: task_id,
                 scope_key: scope_key.clone(),
                 channel: msg.channel.clone(),
                 sender: msg.sender.clone(),
+                class: dispatch_class,
                 preview: truncate_with_ellipsis(&msg.content, 80),
             });
+            queue.pending.len()
+        };
+        {
+            let in_flight_len = in_flight_by_sender.lock().await.len();
+            maybe_adjust_queue_policy_adaptive(queue_len_after_enqueue, in_flight_len);
         }
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let worker_queue = Arc::clone(&queue_store);
         let worker_semaphore = Arc::clone(&semaphore);
+        let worker_stats = Arc::clone(&stats);
         workers.spawn(async move {
             let runtime_defaults = runtime_defaults_snapshot(worker_ctx.as_ref());
             let interrupt_enabled =
@@ -4869,6 +5578,33 @@ async fn run_message_dispatch_loop(
             };
             if dropped_before_start {
                 return;
+            }
+
+            loop {
+                let active = in_flight.lock().await;
+                let in_flight_len = active.len();
+                let background_in_flight = active
+                    .values()
+                    .filter(|state| state.class == DispatchClass::Background)
+                    .count();
+                let interactive_in_flight = in_flight_len.saturating_sub(background_in_flight);
+                drop(active);
+                let soft_limit = runtime_queue_policy_store().soft_limit();
+                let circuit = runtime_circuit_snapshot();
+                let allow = match dispatch_class {
+                    DispatchClass::Interactive => in_flight_len < soft_limit,
+                    DispatchClass::Background => {
+                        let background_cap = (soft_limit / 2).max(1);
+                        circuit.state != "open"
+                            && in_flight_len < soft_limit
+                            && background_in_flight < background_cap
+                            && interactive_in_flight < soft_limit
+                    }
+                };
+                if allow {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
             let _permit = match worker_semaphore.acquire_owned().await {
@@ -4897,6 +5633,7 @@ async fn run_message_dispatch_loop(
                 scope_key: sender_scope_key.clone(),
                 channel: msg.channel.clone(),
                 sender: msg.sender.clone(),
+                class: dispatch_class,
                 preview: truncate_with_ellipsis(&msg.content, 80),
                 started_at: Instant::now(),
                 cancellation: cancellation_token.clone(),
@@ -4936,6 +5673,13 @@ async fn run_message_dispatch_loop(
             }
 
             completion.mark_done();
+            worker_stats
+                .completed_messages
+                .fetch_add(1, Ordering::Relaxed);
+
+            let queue_len = worker_queue.lock().await.pending.len();
+            let in_flight_len = in_flight.lock().await.len();
+            maybe_adjust_queue_policy_adaptive(queue_len, in_flight_len);
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -6369,8 +7113,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
     );
     register_live_channels(channels_by_name.as_ref());
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
+    let queue_policy = runtime_queue_policy_store();
+    queue_policy
+        .hard_in_flight_limit
+        .store(max_in_flight_messages, Ordering::Relaxed);
+    queue_policy
+        .soft_in_flight_limit
+        .store(max_in_flight_messages, Ordering::Relaxed);
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
+    println!(
+        "  ⚙️  Queue policy soft limit: {}",
+        queue_policy.soft_limit()
+    );
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
@@ -6584,6 +7339,66 @@ mod tests {
 
     #[test]
     fn parse_runtime_command_supports_queue_commands_on_all_channels() {
+        assert_eq!(
+            parse_runtime_command("slack", "/stats"),
+            Some(ChannelRuntimeCommand::ShowStats(RuntimeStatusOutput::Text))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/stats json"),
+            Some(ChannelRuntimeCommand::ShowStats(RuntimeStatusOutput::Json))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/health"),
+            Some(ChannelRuntimeCommand::ShowHealth(RuntimeStatusOutput::Text))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/health json"),
+            Some(ChannelRuntimeCommand::ShowHealth(RuntimeStatusOutput::Json))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/incidents"),
+            Some(ChannelRuntimeCommand::ShowIncidents(
+                RuntimeStatusOutput::Text
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/incidents json"),
+            Some(ChannelRuntimeCommand::ShowIncidents(
+                RuntimeStatusOutput::Json
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/mode"),
+            Some(ChannelRuntimeCommand::ShowDispatchMode)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/mode background"),
+            Some(ChannelRuntimeCommand::SetDispatchMode(
+                DispatchClass::Background
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/mode interactive"),
+            Some(ChannelRuntimeCommand::SetDispatchMode(
+                DispatchClass::Interactive
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue policy"),
+            Some(ChannelRuntimeCommand::ShowQueuePolicy)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue policy in-flight 3"),
+            Some(ChannelRuntimeCommand::SetQueuePolicy(
+                QueuePolicySetting::InFlightLimit(3)
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/queue policy adaptive on"),
+            Some(ChannelRuntimeCommand::SetQueuePolicy(
+                QueuePolicySetting::Adaptive(true)
+            ))
+        );
         assert_eq!(
             parse_runtime_command("slack", "/queue"),
             Some(ChannelRuntimeCommand::ShowQueue)
@@ -8198,6 +9013,518 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_stats_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stats-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/stats".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Runtime stats"));
+        assert!(sent[0].contains("queued:"));
+        assert!(sent[0].contains("in-flight:"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_health_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-health-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/health".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Runtime health:"));
+        assert!(sent[0].contains("memory backend:"));
+        assert!(sent[0].contains("unhealthy channels:"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_mode_commands_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-mode-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/mode background".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-mode-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/mode".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("Dispatch mode updated to `background`"));
+        assert!(sent[1].contains("Dispatch mode: `background`"));
+        drop(sent);
+
+        set_dispatch_mode("telegram_chat-1_alice", DispatchClass::Interactive);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_incidents_json_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        record_runtime_incident("failure", "synthetic test incident");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-incidents-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/incidents json".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(sent[0].trim_start_matches("chat-1:"))
+                .expect("valid incidents json");
+        assert_eq!(payload["kind"], "runtime_incidents");
+        assert!(payload["count"].as_u64().unwrap_or(0) >= 1);
+        drop(sent);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_stats_and_health_json_output() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-stats-json-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/stats json".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-health-json-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/health json".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        let stats_json: serde_json::Value =
+            serde_json::from_str(sent[0].trim_start_matches("chat-1:")).expect("valid stats json");
+        assert_eq!(stats_json["kind"], "runtime_stats");
+        assert!(stats_json.get("queue").is_some());
+
+        let health_json: serde_json::Value =
+            serde_json::from_str(sent[1].trim_start_matches("chat-1:")).expect("valid health json");
+        assert_eq!(health_json["kind"], "runtime_health");
+        assert!(health_json.get("memory_backend").is_some());
+        drop(sent);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_queue_policy_commands_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        runtime_queue_policy_store()
+            .hard_in_flight_limit
+            .store(8, Ordering::Relaxed);
+        runtime_queue_policy_store()
+            .soft_in_flight_limit
+            .store(8, Ordering::Relaxed);
+        runtime_queue_policy_store()
+            .adaptive_enabled
+            .store(false, Ordering::Relaxed);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: mock_price_approved_manager(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-policy-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/queue policy".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-policy-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/queue policy in-flight 3".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("Queue policy"));
+        assert!(sent[1].contains("soft in-flight limit is now 3"));
+        drop(sent);
+
+        assert_eq!(runtime_queue_policy_store().soft_limit(), 3);
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
