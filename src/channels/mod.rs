@@ -238,8 +238,10 @@ enum ChannelRuntimeCommand {
     ShowPersona,
     SetPersonaProfile(PersonaProfile),
     SetPersonaTrait(PersonaTrait, u8),
+    SetPersonaLock(bool),
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
+    GenerateRegressionTests,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -250,7 +252,7 @@ enum RuntimeStatusOutput {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DispatchClass {
     Interactive,
     Background,
@@ -372,6 +374,8 @@ impl PersonaVector {
 struct PersonaState {
     profile: PersonaProfile,
     vector: PersonaVector,
+    locked: bool,
+    version: u32,
 }
 
 impl Default for PersonaState {
@@ -380,6 +384,8 @@ impl Default for PersonaState {
         Self {
             profile,
             vector: PersonaVector::from_profile(profile),
+            locked: false,
+            version: 1,
         }
     }
 }
@@ -442,6 +448,8 @@ impl DispatchClass {
 enum QueuePolicySetting {
     InFlightLimit(usize),
     Adaptive(bool),
+    ClassLimit(DispatchClass, usize),
+    ClassSet(DispatchClass),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,14 +528,22 @@ struct RuntimeQueuePolicy {
     hard_in_flight_limit: AtomicUsize,
     soft_in_flight_limit: AtomicUsize,
     adaptive_enabled: AtomicBool,
+    class_limits: Mutex<HashMap<DispatchClass, usize>>,
+    default_class: Mutex<DispatchClass>,
 }
 
 impl Default for RuntimeQueuePolicy {
     fn default() -> Self {
+        let mut default_limits = HashMap::new();
+        default_limits.insert(DispatchClass::Interactive, 3);
+        default_limits.insert(DispatchClass::Background, 5);
+
         Self {
             hard_in_flight_limit: AtomicUsize::new(4),
             soft_in_flight_limit: AtomicUsize::new(4),
             adaptive_enabled: AtomicBool::new(false),
+            class_limits: Mutex::new(default_limits),
+            default_class: Mutex::new(DispatchClass::Interactive),
         }
     }
 }
@@ -542,6 +558,34 @@ impl RuntimeQueuePolicy {
         self.soft_in_flight_limit
             .load(Ordering::Relaxed)
             .clamp(1, hard)
+    }
+
+    fn class_limit(&self, class: DispatchClass) -> usize {
+        let limits = self.class_limits.lock().unwrap();
+        *limits.get(&class).unwrap_or(&self.soft_limit())
+    }
+
+    fn set_class_limit(&self, class: DispatchClass, limit: usize) {
+        let mut limits = self.class_limits.lock().unwrap();
+        limits.insert(class, limit.max(1));
+    }
+
+    fn get_default_class(&self) -> DispatchClass {
+        *self.default_class.lock().unwrap()
+    }
+
+    fn set_default_class(&self, class: DispatchClass) {
+        let mut default = self.default_class.lock().unwrap();
+        *default = class;
+    }
+
+    fn class_limits_snapshot(&self) -> HashMap<String, usize> {
+        let limits = self.class_limits.lock().unwrap();
+        let mut snapshot = HashMap::new();
+        for (class, limit) in limits.iter() {
+            snapshot.insert(class.as_str().to_string(), *limit);
+        }
+        snapshot
     }
 }
 
@@ -959,6 +1003,8 @@ fn effective_persona_for_message(scope_key: &str, message: &str) -> EffectivePer
             state: PersonaState {
                 profile: PersonaProfile::Ops,
                 vector: PersonaVector::from_profile(PersonaProfile::Ops),
+                locked: base.locked,
+                version: base.version,
             },
             mood: PersonaMood::Urgent,
             source: "runtime-pressure",
@@ -977,6 +1023,8 @@ fn effective_persona_for_message(scope_key: &str, message: &str) -> EffectivePer
             state: PersonaState {
                 profile: classified,
                 vector: PersonaVector::from_profile(classified),
+                locked: base.locked,
+                version: base.version,
             },
             mood,
             source: "message-intent",
@@ -1001,6 +1049,16 @@ fn parse_persona_profile(value: &str) -> Option<PersonaProfile> {
         Some(PersonaProfile::Forensic)
     } else if value.eq_ignore_ascii_case("creative") {
         Some(PersonaProfile::Creative)
+    } else {
+        None
+    }
+}
+
+fn parse_dispatch_class(value: &str) -> Option<DispatchClass> {
+    if value.eq_ignore_ascii_case("interactive") || value.eq_ignore_ascii_case("i") {
+        Some(DispatchClass::Interactive)
+    } else if value.eq_ignore_ascii_case("background") || value.eq_ignore_ascii_case("b") {
+        Some(DispatchClass::Background)
     } else {
         None
     }
@@ -1657,7 +1715,16 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/incidents" => {
-            parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents)
+            let sub = args.first().map(|s| s.to_ascii_lowercase());
+            match sub.as_deref() {
+                None | Some("list") => {
+                    parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents)
+                }
+                Some("generate") | Some("generate-tests") => {
+                    Some(ChannelRuntimeCommand::GenerateRegressionTests)
+                }
+                _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
+            }
         }
         "/mode" => match args.first().copied() {
             None => Some(ChannelRuntimeCommand::ShowDispatchMode),
@@ -1688,6 +1755,21 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 } else {
                     Some(ChannelRuntimeCommand::SetPersonaTrait(trait_key, value))
                 }
+            }
+            Some(kind) if kind.eq_ignore_ascii_case("lock") => {
+                let lock_raw = args.get(1)?;
+                let locked = if lock_raw.eq_ignore_ascii_case("on")
+                    || lock_raw.eq_ignore_ascii_case("true")
+                {
+                    true
+                } else if lock_raw.eq_ignore_ascii_case("off")
+                    || lock_raw.eq_ignore_ascii_case("false")
+                {
+                    false
+                } else {
+                    return None;
+                };
+                Some(ChannelRuntimeCommand::SetPersonaLock(locked))
             }
             _ => None,
         },
@@ -1729,6 +1811,29 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                             }
                             _ => None,
                         }
+                    }
+                }
+                Some("class") => {
+                    let sub = args.get(1).map(|s| s.to_ascii_lowercase());
+                    match sub.as_deref() {
+                        None => Some(ChannelRuntimeCommand::ShowQueuePolicy),
+                        Some("set") => {
+                            let class_raw = args.get(2)?;
+                            let class = parse_dispatch_class(class_raw)?;
+                            Some(ChannelRuntimeCommand::SetQueuePolicy(
+                                QueuePolicySetting::ClassSet(class),
+                            ))
+                        }
+                        Some("limit") => {
+                            let class_raw = args.get(2)?;
+                            let limit_raw = args.get(3)?;
+                            let class = parse_dispatch_class(class_raw)?;
+                            let limit = limit_raw.parse::<usize>().ok()?;
+                            Some(ChannelRuntimeCommand::SetQueuePolicy(
+                                QueuePolicySetting::ClassLimit(class, limit),
+                            ))
+                        }
+                        _ => None,
                     }
                 }
                 Some("drop") => {
@@ -3488,17 +3593,103 @@ fn build_runtime_incidents_response(output: RuntimeStatusOutput) -> String {
     }
 }
 
+fn generate_regression_test_from_incidents(incidents: &[RuntimeIncident]) -> String {
+    if incidents.is_empty() {
+        return "// No incidents recorded - no regression tests needed".to_string();
+    }
+
+    let mut test_cases = Vec::new();
+    let mut kind_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    for incident in incidents {
+        *kind_counts.entry(incident.kind.as_str()).or_insert(0) += 1;
+    }
+
+    let common_kinds: Vec<_> = kind_counts
+        .iter()
+        .filter(|(_, count)| **count >= 2)
+        .map(|(kind, _)| *kind)
+        .collect();
+
+    test_cases.push(format!(
+        "// Auto-generated regression tests from {} incidents\n",
+        incidents.len()
+    ));
+    test_cases.push("// Generated by ZeroClaw Failure Immunization System\n\n".to_string());
+    test_cases.push("use super::*;\n\n".to_string());
+
+    for kind in &common_kinds {
+        let test_name = kind
+            .replace(' ', "_")
+            .replace('/', "_")
+            .replace('.', "_")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+
+        let incidents_of_kind: Vec<_> = incidents.iter().filter(|i| &i.kind == kind).collect();
+
+        test_cases.push(format!(
+            "#[test]\nfn regression_{}() {{\n    // {} incidents of type '{}'\n",
+            test_name.to_lowercase(),
+            incidents_of_kind.len(),
+            kind
+        ));
+
+        for (idx, incident) in incidents_of_kind.iter().take(5).enumerate() {
+            let detail_escaped = incident.detail.replace('\\', "\\\\").replace('"', "\\\"");
+            test_cases.push(format!(
+                "    // Incident {}: {}\n",
+                idx + 1,
+                detail_escaped.chars().take(80).collect::<String>()
+            ));
+        }
+
+        test_cases.push("    // TODO: Add actual test assertions based on incident patterns\n    // This is a placeholder for regression testing\n}\n\n".to_string());
+    }
+
+    if common_kinds.is_empty() {
+        test_cases.push(
+            "// No recurring incident patterns detected (need 2+ of same kind)\n".to_string(),
+        );
+    }
+
+    test_cases.push(
+        "// To save these tests, run: /incidents generate-tests > tests/regression_incidents.rs\n"
+            .to_string(),
+    );
+
+    test_cases.join("")
+}
+
+fn generate_tests_from_incidents() -> String {
+    let incidents = runtime_incident_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    generate_regression_test_from_incidents(&incidents)
+}
+
 fn build_queue_policy_response() -> String {
     let policy = runtime_queue_policy_store();
+    let class_limits = policy.class_limits_snapshot();
+    let default_class = policy.get_default_class();
+
     format!(
-        "Queue policy\n- soft in-flight limit: {}\n- hard in-flight limit: {}\n- adaptive: {}\n\nSet with `/queue policy in-flight <n>` or `/queue policy adaptive <on|off>`.",
+        "Queue policy\n- soft in-flight limit: {}\n- hard in-flight limit: {}\n- adaptive: {}\n- default class: {}\n- class limits: interactive={}, background={}\n\nSet with `/queue policy in-flight <n>`, `/queue policy adaptive <on|off>`, `/queue class set <interactive|background>`, or `/queue class limit <interactive|background> <n>`.",
         policy.soft_limit(),
         policy.hard_limit(),
         if policy.adaptive_enabled.load(Ordering::Relaxed) {
             "on"
         } else {
             "off"
-        }
+        },
+        default_class.as_str(),
+        class_limits.get("interactive").unwrap_or(&policy.soft_limit()),
+        class_limits.get("background").unwrap_or(&policy.soft_limit()),
     )
 }
 
@@ -3546,6 +3737,43 @@ fn set_queue_policy(setting: QueuePolicySetting) -> String {
                 "Queue policy updated: adaptive mode is now {}.",
                 if enabled { "on" } else { "off" }
             )
+        }
+        QueuePolicySetting::ClassLimit(class, limit) => {
+            let clamped = limit.clamp(1, policy.hard_limit());
+            policy.set_class_limit(class, clamped);
+            runtime_trace::record_event(
+                "channel_queue_policy_updated",
+                Some("runtime"),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("queue class limit updated"),
+                serde_json::json!({
+                    "class": class.as_str(),
+                    "limit": clamped,
+                }),
+            );
+            format!(
+                "Queue class limit updated: {} in-flight limit is now {clamped}.",
+                class.as_str()
+            )
+        }
+        QueuePolicySetting::ClassSet(class) => {
+            policy.set_default_class(class);
+            runtime_trace::record_event(
+                "channel_queue_policy_updated",
+                Some("runtime"),
+                None,
+                None,
+                None,
+                Some(true),
+                Some("queue default class updated"),
+                serde_json::json!({
+                    "class": class.as_str(),
+                }),
+            );
+            format!("Default dispatch class set to `{}`.", class.as_str())
         }
     }
 }
@@ -4033,6 +4261,7 @@ async fn handle_runtime_command_if_needed(
             build_provider_health_response(output).await
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
+        ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
@@ -4055,7 +4284,7 @@ async fn handle_runtime_command_if_needed(
             let mirror = get_mirror_state(&scope_key);
             let effective = effective_persona_for_message(&scope_key, "");
             format!(
-                "Persona\n- profile: {}\n- effective profile: {} ({})\n- precision: {}\n- warmth: {}\n- boldness: {}\n- brevity: {}\n- curiosity: {}\n- skepticism: {}\n- mirror brevity: {}\n- mirror abstraction: {}\n- mirror cadence: {}\n\nUse `/persona profile <balanced|ops|mentor|forensic|creative>`, `/persona trait <name> <0-100>`, or `/persona reset`.",
+                "Persona\n- profile: {}\n- effective profile: {} ({})\n- precision: {}\n- warmth: {}\n- boldness: {}\n- brevity: {}\n- curiosity: {}\n- skepticism: {}\n- locked: {}\n- version: {}\n- mirror brevity: {}\n- mirror abstraction: {}\n- mirror cadence: {}\n\nUse `/persona profile <balanced|ops|mentor|forensic|creative>`, `/persona trait <name> <0-100>`, `/persona lock <on|off>`, or `/persona reset`.",
                 state.profile.as_str(),
                 effective.state.profile.as_str(),
                 effective.source,
@@ -4065,6 +4294,8 @@ async fn handle_runtime_command_if_needed(
                 state.vector.brevity,
                 state.vector.curiosity,
                 state.vector.skepticism,
+                if state.locked { "yes" } else { "no" },
+                state.version,
                 mirror.brevity_preference,
                 mirror.abstraction_preference,
                 mirror.cadence_preference,
@@ -4072,10 +4303,15 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::SetPersonaProfile(profile) => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
-            let state = PersonaState {
+            let mut state = PersonaState {
                 profile,
                 vector: PersonaVector::from_profile(profile),
+                locked: false,
+                version: 1,
             };
+            let existing = get_persona_state(&scope_key);
+            state.locked = existing.locked;
+            state.version = existing.version + 1;
             set_persona_state(&scope_key, state);
             format!(
                 "Persona profile switched to `{}` for your sender scope.",
@@ -4086,11 +4322,24 @@ async fn handle_runtime_command_if_needed(
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mut state = get_persona_state(&scope_key);
             state.vector.set_trait(trait_key, value);
+            state.version += 1;
             set_persona_state(&scope_key, state);
             format!(
                 "Persona trait `{}` set to {} for your sender scope.",
                 trait_key.as_str(),
                 value
+            )
+        }
+        ChannelRuntimeCommand::SetPersonaLock(locked) => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let mut state = get_persona_state(&scope_key);
+            state.locked = locked;
+            state.version += 1;
+            set_persona_state(&scope_key, state);
+            format!(
+                "Persona lock {} for your sender scope. Version: {}",
+                if locked { "enabled" } else { "disabled" },
+                state.version
             )
         }
         ChannelRuntimeCommand::ResetPersona => {
@@ -6199,15 +6448,19 @@ async fn run_message_dispatch_loop(
                     .count();
                 let interactive_in_flight = in_flight_len.saturating_sub(background_in_flight);
                 drop(active);
-                let soft_limit = runtime_queue_policy_store().soft_limit();
+
+                let policy = runtime_queue_policy_store();
+                let soft_limit = policy.soft_limit();
+                let class_limit = policy.class_limit(dispatch_class);
                 let circuit = runtime_circuit_snapshot();
+
                 let allow = match dispatch_class {
-                    DispatchClass::Interactive => in_flight_len < soft_limit,
+                    DispatchClass::Interactive => in_flight_len < class_limit,
                     DispatchClass::Background => {
-                        let background_cap = (soft_limit / 2).max(1);
+                        let background_limit = policy.class_limit(DispatchClass::Background);
                         circuit.state != "open"
                             && in_flight_len < soft_limit
-                            && background_in_flight < background_cap
+                            && background_in_flight < background_limit
                             && interactive_in_flight < soft_limit
                     }
                 };
