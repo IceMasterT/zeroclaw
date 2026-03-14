@@ -383,6 +383,51 @@ impl Default for PersonaState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaMood {
+    Calm,
+    Urgent,
+    Forensic,
+    Mentor,
+    Creative,
+}
+
+impl PersonaMood {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Calm => "calm",
+            Self::Urgent => "urgent",
+            Self::Forensic => "forensic",
+            Self::Mentor => "mentor",
+            Self::Creative => "creative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MirrorState {
+    brevity_preference: u8,
+    abstraction_preference: u8,
+    cadence_preference: u8,
+}
+
+impl Default for MirrorState {
+    fn default() -> Self {
+        Self {
+            brevity_preference: 55,
+            abstraction_preference: 50,
+            cadence_preference: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectivePersona {
+    state: PersonaState,
+    mood: PersonaMood,
+    source: &'static str,
+}
+
 impl DispatchClass {
     fn as_str(self) -> &'static str {
         match self {
@@ -632,6 +677,11 @@ fn runtime_persona_store() -> &'static Mutex<HashMap<String, PersonaState>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn runtime_mirror_store() -> &'static Mutex<HashMap<String, MirrorState>> {
+    static STORE: OnceLock<Mutex<HashMap<String, MirrorState>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn runtime_circuit_guard_store() -> &'static Arc<RuntimeCircuitGuard> {
     static STORE: OnceLock<Arc<RuntimeCircuitGuard>> = OnceLock::new();
     STORE.get_or_init(|| Arc::new(RuntimeCircuitGuard::default()))
@@ -799,6 +849,146 @@ fn set_persona_state(scope_key: &str, state: PersonaState) {
     }
 }
 
+fn get_mirror_state(scope_key: &str) -> MirrorState {
+    runtime_mirror_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(scope_key)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn set_mirror_state(scope_key: &str, state: MirrorState) {
+    let mut mirrors = runtime_mirror_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if state == MirrorState::default() {
+        mirrors.remove(scope_key);
+    } else {
+        mirrors.insert(scope_key.to_string(), state);
+    }
+}
+
+fn average_u8(prev: u8, next: u8) -> u8 {
+    ((u16::from(prev) + u16::from(next)) / 2) as u8
+}
+
+fn update_mirror_state(scope_key: &str, content: &str) {
+    let mut state = get_mirror_state(scope_key);
+    let trimmed = content.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let word_count = trimmed.split_whitespace().count();
+
+    let brevity_signal = if lower.contains("deep")
+        || lower.contains("step by step")
+        || lower.contains("detailed")
+        || lower.contains("details")
+    {
+        20
+    } else if word_count <= 8
+        || lower.contains("tldr")
+        || lower.contains("brief")
+        || lower.contains("short")
+    {
+        85
+    } else {
+        55
+    };
+
+    let abstraction_signal =
+        if lower.contains("concept") || lower.contains("theory") || lower.contains("architect") {
+            80
+        } else if lower.contains("exact")
+            || lower.contains("code")
+            || lower.contains("command")
+            || lower.contains("specific")
+        {
+            25
+        } else {
+            50
+        };
+
+    let cadence_signal = if trimmed.ends_with('?') || lower.contains("why") || lower.contains("how")
+    {
+        75
+    } else {
+        45
+    };
+
+    state.brevity_preference = average_u8(state.brevity_preference, brevity_signal);
+    state.abstraction_preference = average_u8(state.abstraction_preference, abstraction_signal);
+    state.cadence_preference = average_u8(state.cadence_preference, cadence_signal);
+    set_mirror_state(scope_key, state);
+}
+
+fn classify_contextual_profile(message: &str) -> Option<PersonaProfile> {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("debug")
+        || lower.contains("root cause")
+        || lower.contains("trace")
+        || lower.contains("postmortem")
+        || lower.contains("failure")
+    {
+        return Some(PersonaProfile::Forensic);
+    }
+    if lower.contains("explain")
+        || lower.contains("teach")
+        || lower.contains("learn")
+        || lower.contains("guide")
+    {
+        return Some(PersonaProfile::Mentor);
+    }
+    if lower.contains("brainstorm")
+        || lower.contains("creative")
+        || lower.contains("invent")
+        || lower.contains("ideas")
+    {
+        return Some(PersonaProfile::Creative);
+    }
+    None
+}
+
+fn effective_persona_for_message(scope_key: &str, message: &str) -> EffectivePersona {
+    let base = get_persona_state(scope_key);
+    let circuit = runtime_circuit_snapshot();
+    let high_pressure = circuit.state == "open";
+
+    if high_pressure {
+        return EffectivePersona {
+            state: PersonaState {
+                profile: PersonaProfile::Ops,
+                vector: PersonaVector::from_profile(PersonaProfile::Ops),
+            },
+            mood: PersonaMood::Urgent,
+            source: "runtime-pressure",
+        };
+    }
+
+    if let Some(classified) = classify_contextual_profile(message) {
+        let mood = match classified {
+            PersonaProfile::Forensic => PersonaMood::Forensic,
+            PersonaProfile::Mentor => PersonaMood::Mentor,
+            PersonaProfile::Creative => PersonaMood::Creative,
+            PersonaProfile::Ops => PersonaMood::Urgent,
+            PersonaProfile::Balanced => PersonaMood::Calm,
+        };
+        return EffectivePersona {
+            state: PersonaState {
+                profile: classified,
+                vector: PersonaVector::from_profile(classified),
+            },
+            mood,
+            source: "message-intent",
+        };
+    }
+
+    EffectivePersona {
+        state: base,
+        mood: PersonaMood::Calm,
+        source: "sender-profile",
+    }
+}
+
 fn parse_persona_profile(value: &str) -> Option<PersonaProfile> {
     if value.eq_ignore_ascii_case("balanced") {
         Some(PersonaProfile::Balanced)
@@ -833,17 +1023,22 @@ fn parse_persona_trait(value: &str) -> Option<PersonaTrait> {
     }
 }
 
-fn build_persona_instruction(state: PersonaState) -> String {
-    let v = state.vector;
+fn build_persona_instruction(persona: EffectivePersona, mirror: MirrorState) -> String {
+    let v = persona.state.vector;
     format!(
-        "\n\nPersonality profile: {}.\nPersonality vector (0-100): precision={}, warmth={}, boldness={}, brevity={}, curiosity={}, skepticism={}.\nBehavioral contract: keep identity stable, prioritize these vector signals when choosing tone/detail/assertiveness, and remain deterministic for operational instructions.",
-        state.profile.as_str(),
+        "\n\nPersonality profile: {} (source: {}).\nOperational mood: {}.\nPersonality vector (0-100): precision={}, warmth={}, boldness={}, brevity={}, curiosity={}, skepticism={}.\nUser mirror model: brevity_preference={}, abstraction_preference={}, cadence_preference={}.\nBehavioral contract: keep identity stable, prioritize these vector signals when choosing tone/detail/assertiveness, and remain deterministic for operational instructions.",
+        persona.state.profile.as_str(),
+        persona.source,
+        persona.mood.as_str(),
         v.precision,
         v.warmth,
         v.boldness,
         v.brevity,
         v.curiosity,
-        v.skepticism
+        v.skepticism,
+        mirror.brevity_preference,
+        mirror.abstraction_preference,
+        mirror.cadence_preference,
     )
 }
 
@@ -3724,15 +3919,22 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowPersona => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let state = get_persona_state(&scope_key);
+            let mirror = get_mirror_state(&scope_key);
+            let effective = effective_persona_for_message(&scope_key, "");
             format!(
-                "Persona\n- profile: {}\n- precision: {}\n- warmth: {}\n- boldness: {}\n- brevity: {}\n- curiosity: {}\n- skepticism: {}\n\nUse `/persona profile <balanced|ops|mentor|forensic|creative>`, `/persona trait <name> <0-100>`, or `/persona reset`.",
+                "Persona\n- profile: {}\n- effective profile: {} ({})\n- precision: {}\n- warmth: {}\n- boldness: {}\n- brevity: {}\n- curiosity: {}\n- skepticism: {}\n- mirror brevity: {}\n- mirror abstraction: {}\n- mirror cadence: {}\n\nUse `/persona profile <balanced|ops|mentor|forensic|creative>`, `/persona trait <name> <0-100>`, or `/persona reset`.",
                 state.profile.as_str(),
+                effective.state.profile.as_str(),
+                effective.source,
                 state.vector.precision,
                 state.vector.warmth,
                 state.vector.boldness,
                 state.vector.brevity,
                 state.vector.curiosity,
                 state.vector.skepticism,
+                mirror.brevity_preference,
+                mirror.abstraction_preference,
+                mirror.cadence_preference,
             )
         }
         ChannelRuntimeCommand::SetPersonaProfile(profile) => {
@@ -3761,6 +3963,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ResetPersona => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             set_persona_state(&scope_key, PersonaState::default());
+            set_mirror_state(&scope_key, MirrorState::default());
             "Persona reset to default balanced profile for your sender scope.".to_string()
         }
         ChannelRuntimeCommand::ShowQueuePolicy => build_queue_policy_response(),
@@ -5123,9 +5326,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         expose_internal_tool_details,
     );
     let sender_scope_key = interruption_scope_key(&msg);
-    system_prompt.push_str(&build_persona_instruction(get_persona_state(
-        &sender_scope_key,
-    )));
+    update_mirror_state(&sender_scope_key, &msg.content);
+    let effective_persona = effective_persona_for_message(&sender_scope_key, &msg.content);
+    let mirror_state = get_mirror_state(&sender_scope_key);
+    system_prompt.push_str(&build_persona_instruction(effective_persona, mirror_state));
     system_prompt.push_str(&build_runtime_tool_visibility_prompt(
         ctx.tools_registry.as_ref(),
         &excluded_tools_snapshot,
@@ -9651,6 +9855,41 @@ BTC is currently around $65,000 based on latest tool output."#
 
         set_persona_state("telegram_chat-1_alice", PersonaState::default());
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mirror_model_updates_from_user_message_shape() {
+        let scope = "telegram_chat-1_mirror";
+        set_mirror_state(scope, MirrorState::default());
+
+        update_mirror_state(scope, "tldr please");
+        let quick = get_mirror_state(scope);
+        assert!(quick.brevity_preference >= 60);
+
+        update_mirror_state(scope, "please explain with detailed step by step reasoning");
+        let detailed = get_mirror_state(scope);
+        assert!(detailed.brevity_preference <= quick.brevity_preference);
+        assert!(detailed.brevity_preference < 70);
+
+        set_mirror_state(scope, MirrorState::default());
+    }
+
+    #[test]
+    fn effective_persona_switches_by_message_intent() {
+        let scope = "telegram_chat-1_persona_intent";
+        set_persona_state(scope, PersonaState::default());
+
+        let forensic = effective_persona_for_message(scope, "debug root cause from logs");
+        assert_eq!(forensic.state.profile, PersonaProfile::Forensic);
+        assert_eq!(forensic.source, "message-intent");
+
+        let mentor = effective_persona_for_message(scope, "please teach me how this works");
+        assert_eq!(mentor.state.profile, PersonaProfile::Mentor);
+
+        let creative = effective_persona_for_message(scope, "brainstorm creative ideas");
+        assert_eq!(creative.state.profile, PersonaProfile::Creative);
+
+        set_persona_state(scope, PersonaState::default());
     }
 
     #[tokio::test]
