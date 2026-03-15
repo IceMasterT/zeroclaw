@@ -242,6 +242,9 @@ enum ChannelRuntimeCommand {
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     GenerateRegressionTests,
+    ShowWorldModel,
+    ShowDreamCycle,
+    ShowMythic,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -491,6 +494,103 @@ struct RuntimeIncident {
     kind: String,
     detail: String,
 }
+
+#[derive(Debug, Clone, Default)]
+struct WorldModelShards {
+    repo_architecture: Vec<String>,
+    user_intent_history: Vec<String>,
+    failure_patterns: Vec<String>,
+    enabled: bool,
+}
+
+impl WorldModelShards {
+    fn add_repo_insight(&mut self, insight: String) {
+        if !self.enabled {
+            return;
+        }
+        if self.repo_architecture.len() >= 20 {
+            self.repo_architecture.remove(0);
+        }
+        self.repo_architecture.push(insight);
+    }
+
+    fn fuse(&self) -> String {
+        if self.repo_architecture.is_empty() && self.user_intent_history.is_empty() {
+            return String::new();
+        }
+        format!(
+            "[world-model: {} repo insights, {} intents, {} failures]",
+            self.repo_architecture.len(),
+            self.user_intent_history.len(),
+            self.failure_patterns.len()
+        )
+    }
+}
+
+static WORLD_MODEL_SHARDS: std::sync::LazyLock<std::sync::Mutex<WorldModelShards>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(WorldModelShards::default()));
+
+#[derive(Debug, Clone, Default)]
+struct DreamCycle {
+    last_run: Option<Instant>,
+    interval_secs: u64,
+    candidates: Vec<String>,
+    approved_count: usize,
+    enabled: bool,
+}
+
+impl DreamCycle {
+    fn should_run(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(last) = self.last_run {
+            last.elapsed() > Duration::from_secs(self.interval_secs)
+        } else {
+            true
+        }
+    }
+
+    fn run(&mut self) {
+        self.last_run = Some(Instant::now());
+    }
+}
+
+static DREAM_CYCLE: std::sync::LazyLock<std::sync::Mutex<DreamCycle>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(DreamCycle {
+            interval_secs: 86400,
+            enabled: false,
+            ..Default::default()
+        })
+    });
+
+#[derive(Debug, Clone, Default)]
+struct MythicMemory {
+    rituals: Vec<String>,
+    startup_oath: Option<String>,
+    debrief_style: Option<String>,
+    enabled: bool,
+}
+
+impl MythicMemory {
+    fn invoke_startup(&self) -> Option<String> {
+        self.startup_oath.clone()
+    }
+
+    fn invoke_debrief(&self) -> Option<String> {
+        self.debrief_style.clone()
+    }
+}
+
+static MYTHIC_MEMORY: std::sync::LazyLock<std::sync::Mutex<MythicMemory>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(MythicMemory {
+            rituals: vec!["analysis".to_string(), "execution".to_string()],
+            enabled: false,
+            ..Default::default()
+        })
+    });
 
 #[derive(Debug)]
 struct RuntimeCircuitGuard {
@@ -1726,6 +1826,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
             }
         }
+        "/worldmodel" | "/shards" => Some(ChannelRuntimeCommand::ShowWorldModel),
+        "/dream" | "/dreamcycle" => Some(ChannelRuntimeCommand::ShowDreamCycle),
+        "/mythic" | "/ritual" => Some(ChannelRuntimeCommand::ShowMythic),
         "/mode" => match args.first().copied() {
             None => Some(ChannelRuntimeCommand::ShowDispatchMode),
             Some(raw) if raw.eq_ignore_ascii_case("interactive") => Some(
@@ -4262,6 +4365,39 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
+        ChannelRuntimeCommand::ShowWorldModel => {
+            let shards = WORLD_MODEL_SHARDS.lock().unwrap();
+            format!(
+                "World Model Shards (P2 Experimental):\n- repo insights: {}\n- user intents: {}\n- failure patterns: {}\n- enabled: {}\n\nFuse: {}",
+                shards.repo_architecture.len(),
+                shards.user_intent_history.len(),
+                shards.failure_patterns.len(),
+                if shards.enabled { "yes" } else { "no (default off)" },
+                shards.fuse()
+            )
+        }
+        ChannelRuntimeCommand::ShowDreamCycle => {
+            let dream = DREAM_CYCLE.lock().unwrap();
+            let last = dream.last_run.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            format!(
+                "Dream Cycle (P2 Experimental):\n- interval: {}s\n- candidates: {}\n- approved: {}\n- enabled: {}\n- last run: {}s ago",
+                dream.interval_secs,
+                dream.candidates.len(),
+                dream.approved_count,
+                if dream.enabled { "yes" } else { "no (default off)" },
+                last
+            )
+        }
+        ChannelRuntimeCommand::ShowMythic => {
+            let mythic = MYTHIC_MEMORY.lock().unwrap();
+            format!(
+                "Mythic Memory (P2 Experimental):\n- rituals: {:?}\n- startup oath: {}\n- debrief style: {}\n- enabled: {}\n\nUse `/mythic` to view status.",
+                mythic.rituals,
+                mythic.startup_oath.as_deref().unwrap_or("(not set)"),
+                mythic.debrief_style.as_deref().unwrap_or("(not set)"),
+                if mythic.enabled { "yes" } else { "no (default off)" }
+            )
+        }
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
