@@ -242,6 +242,8 @@ enum ChannelRuntimeCommand {
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     GenerateRegressionTests,
+    ShowEpistemicLedger,
+    ClearEpistemicLedger,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -492,6 +494,92 @@ struct RuntimeIncident {
     detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaimSource {
+    Inference,
+    ToolOutput,
+    Memory,
+    UserInput,
+    ExternalApi,
+}
+
+impl ClaimSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ClaimSource::Inference => "inference",
+            ClaimSource::ToolOutput => "tool_output",
+            ClaimSource::Memory => "memory",
+            ClaimSource::UserInput => "user_input",
+            ClaimSource::ExternalApi => "external_api",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaimProvenance {
+    claim_id: u64,
+    source: ClaimSource,
+    tool_name: Option<String>,
+    confidence: f32,
+    timestamp: Instant,
+    evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EpistemicLedger {
+    claims: VecDeque<ClaimProvenance>,
+    next_id: u64,
+    enabled: bool,
+    max_claims: usize,
+}
+
+impl EpistemicLedger {
+    fn add_claim(
+        &mut self,
+        source: ClaimSource,
+        tool_name: Option<String>,
+        confidence: f32,
+        evidence_ref: Option<String>,
+    ) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        if self.claims.len() >= self.max_claims {
+            self.claims.pop_front();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.claims.push_back(ClaimProvenance {
+            claim_id: id,
+            source,
+            tool_name,
+            confidence,
+            timestamp: Instant::now(),
+            evidence_ref,
+        });
+        id
+    }
+
+    fn get_claims_for_turn(&self, turn_id: u64) -> Vec<&ClaimProvenance> {
+        self.claims
+            .iter()
+            .filter(|c| c.claim_id >= turn_id)
+            .collect()
+    }
+
+    fn summarize_by_source(&self) -> std::collections::HashMap<String, usize> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for claim in &self.claims {
+            *counts.entry(claim.source.as_str().to_string()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn clear(&mut self) {
+        self.claims.clear();
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeCircuitGuard {
     failure_threshold: u64,
@@ -735,6 +823,18 @@ fn runtime_circuit_guard_store() -> &'static Arc<RuntimeCircuitGuard> {
 fn runtime_incident_store() -> &'static Mutex<VecDeque<RuntimeIncident>> {
     static STORE: OnceLock<Mutex<VecDeque<RuntimeIncident>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(128)))
+}
+
+fn runtime_epistemic_ledger() -> &'static Mutex<EpistemicLedger> {
+    static STORE: OnceLock<Mutex<EpistemicLedger>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(EpistemicLedger {
+            claims: VecDeque::with_capacity(256),
+            next_id: 1,
+            enabled: true,
+            max_claims: 100,
+        })
+    })
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -1724,6 +1824,16 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                     Some(ChannelRuntimeCommand::GenerateRegressionTests)
                 }
                 _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
+            }
+        }
+        "/epistemic" | "/claims" | "/provenance" => {
+            let sub = args.first().map(|s| s.to_ascii_lowercase());
+            match sub.as_deref() {
+                None | Some("show") | Some("list") => {
+                    Some(ChannelRuntimeCommand::ShowEpistemicLedger)
+                }
+                Some("clear") | Some("reset") => Some(ChannelRuntimeCommand::ClearEpistemicLedger),
+                _ => Some(ChannelRuntimeCommand::ShowEpistemicLedger),
             }
         }
         "/mode" => match args.first().copied() {
@@ -4262,6 +4372,31 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
+        ChannelRuntimeCommand::ShowEpistemicLedger => {
+            let ledger = runtime_epistemic_ledger().lock().unwrap();
+            let summary = ledger.summarize_by_source();
+            let total = ledger.claims.len();
+
+            if total == 0 {
+                "Epistemic ledger: no claims recorded".to_string()
+            } else {
+                let mut out = format!(
+                    "Epistemic ledger: {} claims recorded\n\nBy source:\n",
+                    total
+                );
+                for (source, count) in &summary {
+                    let _ = writeln!(out, "- {}: {}", source, count);
+                }
+                out.push_str("\nUse `/claims clear` to reset the ledger.");
+                out
+            }
+        }
+        ChannelRuntimeCommand::ClearEpistemicLedger => {
+            let mut ledger = runtime_epistemic_ledger().lock().unwrap();
+            let before = ledger.claims.len();
+            ledger.clear();
+            format!("Epistemic ledger cleared: {} claims removed.", before)
+        }
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
