@@ -242,6 +242,8 @@ enum ChannelRuntimeCommand {
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     GenerateRegressionTests,
+    ShowGoalDebt,
+    ClearGoalDebt,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -492,6 +494,79 @@ struct RuntimeIncident {
     detail: String,
 }
 
+#[derive(Debug, Clone)]
+struct GoalDebtEntry {
+    id: u64,
+    scope_key: String,
+    original_message: String,
+    deferred_at: Instant,
+    priority: u8,
+    channel: String,
+    sender: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GoalDebtStore {
+    entries: VecDeque<GoalDebtEntry>,
+    next_id: u64,
+    enabled: bool,
+    max_debt: usize,
+    repay_threshold: usize,
+}
+
+impl GoalDebtStore {
+    fn add_debt(
+        &mut self,
+        scope_key: String,
+        message: String,
+        priority: u8,
+        channel: String,
+        sender: String,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        if self.entries.len() >= self.max_debt {
+            return;
+        }
+        let entry = GoalDebtEntry {
+            id: self.next_id,
+            scope_key,
+            original_message: message,
+            deferred_at: Instant::now(),
+            priority,
+            channel,
+            sender,
+        };
+        self.next_id += 1;
+        self.entries.push_back(entry);
+    }
+
+    fn get_repayable(&self, current_load: usize) -> Vec<GoalDebtEntry> {
+        if current_load >= self.repay_threshold {
+            return Vec::new();
+        }
+        self.entries.iter().cloned().collect()
+    }
+
+    fn repay(&mut self, id: u64) -> Option<GoalDebtEntry> {
+        let pos = self.entries.iter().position(|e| e.id == id);
+        if let Some(idx) = pos {
+            Some(self.entries.remove(idx).unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn clear_for_scope(&mut self, scope_key: &str) {
+        self.entries.retain(|e| e.scope_key != scope_key);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeCircuitGuard {
     failure_threshold: u64,
@@ -735,6 +810,19 @@ fn runtime_circuit_guard_store() -> &'static Arc<RuntimeCircuitGuard> {
 fn runtime_incident_store() -> &'static Mutex<VecDeque<RuntimeIncident>> {
     static STORE: OnceLock<Mutex<VecDeque<RuntimeIncident>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(128)))
+}
+
+fn runtime_goal_debt_store() -> &'static Mutex<GoalDebtStore> {
+    static STORE: OnceLock<Mutex<GoalDebtStore>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(GoalDebtStore {
+            entries: VecDeque::with_capacity(64),
+            next_id: 1,
+            enabled: true,
+            max_debt: 20,
+            repay_threshold: 3,
+        })
+    })
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -1724,6 +1812,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                     Some(ChannelRuntimeCommand::GenerateRegressionTests)
                 }
                 _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
+            }
+        }
+        "/debt" => {
+            let sub = args.first().map(|s| s.to_ascii_lowercase());
+            match sub.as_deref() {
+                None | Some("list") | Some("show") => Some(ChannelRuntimeCommand::ShowGoalDebt),
+                Some("clear") | Some("clear-all") => Some(ChannelRuntimeCommand::ClearGoalDebt),
+                _ => None,
             }
         }
         "/mode" => match args.first().copied() {
@@ -4262,6 +4358,34 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
+        ChannelRuntimeCommand::ShowGoalDebt => {
+            let store = runtime_goal_debt_store().lock().unwrap();
+            let entries_len = store.len();
+            let threshold = store.repay_threshold;
+            let can_repay = entries_len > 0 && entries_len < threshold;
+
+            if entries_len == 0 {
+                "Goal debt: none (no deferred intents)".to_string()
+            } else {
+                format!(
+                    "Goal debt: {} pending\n- repay threshold: {}\n- can repay now: {}\n\nUse `/debt clear` to clear your debt.",
+                    entries_len,
+                    threshold,
+                    if can_repay { "yes" } else { "no" }
+                )
+            }
+        }
+        ChannelRuntimeCommand::ClearGoalDebt => {
+            let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
+            let mut store = runtime_goal_debt_store().lock().unwrap();
+            let before = store.len();
+            store.clear_for_scope(&scope_key);
+            let after = store.len();
+            format!(
+                "Goal debt cleared: {} entries removed for your scope.",
+                before.saturating_sub(after)
+            )
+        }
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
