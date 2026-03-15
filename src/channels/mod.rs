@@ -242,6 +242,7 @@ enum ChannelRuntimeCommand {
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     GenerateRegressionTests,
+    ShowParliament,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -490,6 +491,34 @@ struct RuntimeIncident {
     ts_unix: u64,
     kind: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParliamentVoice {
+    Security,
+    Speed,
+    Correctness,
+    Ux,
+}
+
+impl ParliamentVoice {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ParliamentVoice::Security => "security",
+            ParliamentVoice::Speed => "speed",
+            ParliamentVoice::Correctness => "correctness",
+            ParliamentVoice::Ux => "ux",
+        }
+    }
+
+    fn default_weight(&self) -> f32 {
+        match self {
+            ParliamentVoice::Security => 2.0,
+            ParliamentVoice::Speed => 1.5,
+            ParliamentVoice::Correctness => 2.0,
+            ParliamentVoice::Ux => 1.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1726,6 +1755,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
             }
         }
+        "/parliament" | "/votes" => Some(ChannelRuntimeCommand::ShowParliament),
         "/mode" => match args.first().copied() {
             None => Some(ChannelRuntimeCommand::ShowDispatchMode),
             Some(raw) if raw.eq_ignore_ascii_case("interactive") => Some(
@@ -4262,6 +4292,9 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
+        ChannelRuntimeCommand::ShowParliament => {
+            "Parliament (P2 Experimental): Internal agent parliament for weighted multi-voice voting.\n\nThis is experimental infrastructure. Use `/parliament` to check status.\n\nVoices: security (weight 2.0), speed (1.5), correctness (2.0), ux (1.0)".to_string()
+        }
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
