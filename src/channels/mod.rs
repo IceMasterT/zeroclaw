@@ -242,6 +242,7 @@ enum ChannelRuntimeCommand {
     ResetPersona,
     ShowIncidents(RuntimeStatusOutput),
     GenerateRegressionTests,
+    ShowCuriosity,
     ShowQueuePolicy,
     SetQueuePolicy(QueuePolicySetting),
 }
@@ -491,6 +492,48 @@ struct RuntimeIncident {
     kind: String,
     detail: String,
 }
+
+#[derive(Debug, Clone, Default)]
+struct CuriosityBudget {
+    tokens_remaining: f32,
+    tokens_budget: f32,
+    exploration_count: usize,
+    exploitation_count: usize,
+    enabled: bool,
+}
+
+impl CuriosityBudget {
+    fn allocate(&mut self, amount: f32) -> bool {
+        if !self.enabled || self.tokens_remaining < amount {
+            return false;
+        }
+        self.tokens_remaining -= amount;
+        true
+    }
+
+    fn spend_on_exploration(&mut self) {
+        self.exploration_count += 1;
+    }
+
+    fn spend_on_exploitation(&mut self) {
+        self.exploitation_count += 1;
+    }
+
+    fn reset(&mut self) {
+        self.tokens_remaining = self.tokens_budget;
+    }
+}
+
+static CURIOUSITY_BUDGET: std::sync::LazyLock<std::sync::Mutex<CuriosityBudget>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(CuriosityBudget {
+            tokens_remaining: 10.0,
+            tokens_budget: 10.0,
+            exploration_count: 0,
+            exploitation_count: 0,
+            enabled: false,
+        })
+    });
 
 #[derive(Debug)]
 struct RuntimeCircuitGuard {
@@ -1726,6 +1769,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 _ => parse_runtime_status_output(&args).map(ChannelRuntimeCommand::ShowIncidents),
             }
         }
+        "/curiosity" | "/explore" => Some(ChannelRuntimeCommand::ShowCuriosity),
         "/mode" => match args.first().copied() {
             None => Some(ChannelRuntimeCommand::ShowDispatchMode),
             Some(raw) if raw.eq_ignore_ascii_case("interactive") => Some(
@@ -4262,6 +4306,17 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowIncidents(output) => build_runtime_incidents_response(output),
         ChannelRuntimeCommand::GenerateRegressionTests => generate_tests_from_incidents(),
+        ChannelRuntimeCommand::ShowCuriosity => {
+            let budget = CURIOUSITY_BUDGET.lock().unwrap();
+            format!(
+                "Curiosity Budget (P2 Experimental):\n- tokens: {:.1}/{:.1}\n- exploration: {}\n- exploitation: {}\n- enabled: {}\n\nUse `/curiosity` to view status.",
+                budget.tokens_remaining,
+                budget.tokens_budget,
+                budget.exploration_count,
+                budget.exploitation_count,
+                if budget.enabled { "yes" } else { "no (default off)" }
+            )
+        }
         ChannelRuntimeCommand::ShowDispatchMode => {
             let scope_key = interruption_scope_key_from_parts(source_channel, reply_target, sender);
             let mode = get_dispatch_mode(&scope_key);
