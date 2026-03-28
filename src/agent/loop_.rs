@@ -25,6 +25,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -378,6 +379,10 @@ const CONTEXT_MIN_NON_SYSTEM_MESSAGES: usize = 8;
 const CONTEXT_MAX_MESSAGE_CHARS: usize = 3_000;
 const CONTEXT_TRIM_SUMMARY_MAX_SOURCE_CHARS: usize = 8_000;
 const CONTEXT_TRIM_SUMMARY_MAX_CHARS: usize = 1_200;
+const TOOL_RESULT_HISTORY_MAX_CHARS: usize = 2_000;
+const MIN_ADAPTIVE_CONTEXT_TOKENS: usize = 24_000;
+const USER_MESSAGE_MAX_CHARS: usize = 8_000;
+const ENRICHED_CONTEXT_MAX_CHARS: usize = 14_000;
 
 /// Configuration for periodic safety-constraint re-injection (heartbeat).
 #[derive(Clone)]
@@ -612,6 +617,108 @@ fn enforce_context_budget(
         truncated_messages,
         summary_inserted,
     )
+}
+
+fn infer_model_context_window_tokens(model: &str) -> Option<usize> {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    let table: [(&str, usize); 11] = [
+        ("gpt-4.1", 1_048_576),
+        ("gpt-4o", 128_000),
+        ("gpt-4", 128_000),
+        ("claude-3-7", 200_000),
+        ("claude-3-5", 200_000),
+        ("claude-3", 200_000),
+        ("gemini-2.5", 1_000_000),
+        ("gemini-2.0", 1_000_000),
+        ("gemini-1.5", 1_000_000),
+        ("qwen", 131_072),
+        ("nemotron", 262_144),
+    ];
+
+    for (needle, window) in table {
+        if lower.contains(needle) {
+            return Some(window);
+        }
+    }
+
+    None
+}
+
+fn effective_context_budget(max_context_tokens: usize, model: &str) -> usize {
+    let configured = max_context_tokens.max(MIN_ADAPTIVE_CONTEXT_TOKENS);
+    if let Some(window) = infer_model_context_window_tokens(model) {
+        let adaptive = ((window as f64) * 0.68).round() as usize;
+        adaptive.max(MIN_ADAPTIVE_CONTEXT_TOKENS).min(configured)
+    } else {
+        configured
+    }
+}
+
+fn is_context_window_error_message(error: &anyhow::Error) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    [
+        "exceeds the context window",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+        "request exceeds model context window",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
+fn compress_tool_output_for_history(tool_name: &str, output: &str) -> String {
+    let char_count = output.chars().count();
+    if char_count <= TOOL_RESULT_HISTORY_MAX_CHARS {
+        return output.to_string();
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    output.hash(&mut hasher);
+    let digest = hasher.finish();
+    let preview = truncate_with_ellipsis(output, TOOL_RESULT_HISTORY_MAX_CHARS);
+    format!(
+        "{preview}\n\n[tool-output-truncated name={tool_name} total_chars={char_count} digest={digest:016x}]"
+    )
+}
+
+fn build_enriched_user_message(
+    now: &str,
+    mem_context: &str,
+    hw_context: &str,
+    user_msg: &str,
+) -> String {
+    let mem_section = truncate_with_ellipsis(mem_context, ENRICHED_CONTEXT_MAX_CHARS / 2);
+    let hw_section = truncate_with_ellipsis(hw_context, ENRICHED_CONTEXT_MAX_CHARS / 2);
+    let user_section = truncate_with_ellipsis(user_msg, USER_MESSAGE_MAX_CHARS);
+    let combined_context = format!("{mem_section}{hw_section}");
+
+    let enriched = if combined_context.is_empty() {
+        format!("[{now}] {user_section}")
+    } else {
+        format!("{combined_context}[{now}] {user_section}")
+    };
+
+    let mut bounded = truncate_with_ellipsis(&enriched, ENRICHED_CONTEXT_MAX_CHARS);
+    if bounded.chars().count() > ENRICHED_CONTEXT_MAX_CHARS {
+        bounded = bounded.chars().take(ENRICHED_CONTEXT_MAX_CHARS).collect();
+    }
+    tracing::debug!(
+        memory_chars = mem_section.chars().count(),
+        hardware_chars = hw_section.chars().count(),
+        user_chars = user_section.chars().count(),
+        enriched_chars = bounded.chars().count(),
+        "assembled bounded enriched user message"
+    );
+    bounded
 }
 
 fn usage_period_label(period: UsagePeriod) -> &'static str {
@@ -1329,6 +1436,12 @@ pub async fn run_tool_call_loop(
         .flatten();
     let mut progress_tracker = ProgressTracker::default();
     let mut active_model = model.to_string();
+    let configured_max_context_tokens = TOOL_LOOP_MAX_CONTEXT_TOKENS
+        .try_with(|value| *value)
+        .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS)
+        .max(MIN_ADAPTIVE_CONTEXT_TOKENS);
+    let mut dynamic_max_context_tokens = configured_max_context_tokens;
+    let mut aggressive_context_retry_used = false;
     let canary_guard = CanaryGuard::new(
         TOOL_LOOP_CANARY_TOKENS_ENABLED
             .try_with(|enabled| *enabled)
@@ -1417,9 +1530,9 @@ pub async fn run_tool_call_loop(
             None
         };
 
-        let max_context_tokens = TOOL_LOOP_MAX_CONTEXT_TOKENS
-            .try_with(|value| *value)
-            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
+        let model_adaptive_budget =
+            effective_context_budget(dynamic_max_context_tokens, &active_model);
+        let max_context_tokens = model_adaptive_budget;
         let (
             tokens_before_trim,
             mut tokens_after_trim,
@@ -1444,6 +1557,7 @@ pub async fn run_tool_call_loop(
                     "tokens_before_trim": tokens_before_trim,
                     "tokens_after_trim": tokens_after_trim,
                     "max_context_tokens": max_context_tokens,
+                    "configured_max_context_tokens": configured_max_context_tokens,
                 }),
             );
         }
@@ -1468,6 +1582,7 @@ pub async fn run_tool_call_loop(
                     "removed_messages": removed_msgs,
                     "truncated_messages": truncated_msgs,
                     "summary_inserted": summary_inserted,
+                    "configured_max_context_tokens": configured_max_context_tokens,
                 }),
             );
             return Err(anyhow::anyhow!(reason));
@@ -1500,6 +1615,7 @@ pub async fn run_tool_call_loop(
                     "removed_messages": removed_msgs,
                     "truncated_messages": truncated_msgs,
                     "summary_inserted": summary_inserted,
+                    "configured_max_context_tokens": configured_max_context_tokens,
                 }),
             );
         }
@@ -2016,6 +2132,36 @@ pub async fn run_tool_call_loop(
                 )
             }
             Err(e) => {
+                if is_context_window_error_message(&e) && !aggressive_context_retry_used {
+                    aggressive_context_retry_used = true;
+                    let previous_budget = dynamic_max_context_tokens;
+                    dynamic_max_context_tokens =
+                        ((dynamic_max_context_tokens as f64) * 0.78).round() as usize;
+                    dynamic_max_context_tokens = dynamic_max_context_tokens
+                        .max(MIN_ADAPTIVE_CONTEXT_TOKENS)
+                        .min(configured_max_context_tokens);
+                    let aggressive_history_cap = CONTEXT_MIN_NON_SYSTEM_MESSAGES.max(12);
+                    trim_history(history, aggressive_history_cap);
+
+                    runtime_trace::record_event(
+                        "context_budget_retry_after_provider_overflow",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        Some("provider rejected context length; applied aggressive trim and retry"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "previous_budget": previous_budget,
+                            "next_budget": dynamic_max_context_tokens,
+                            "history_messages_after_trim": history.len(),
+                        }),
+                    );
+
+                    continue;
+                }
+
                 let safe_error = crate::providers::sanitize_api_error(&e.to_string());
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
@@ -2601,11 +2747,12 @@ pub async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let history_output = compress_tool_output_for_history(&tool_name, &outcome.output);
+            individual_results.push((tool_call_id, history_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, history_output
             );
         }
 
@@ -3153,13 +3300,9 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {msg}")
-        } else {
-            format!("{context}[{now}] {msg}")
-        };
+        let enriched =
+            build_enriched_user_message(&now.to_string(), &mem_context, &hw_context, &msg);
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
@@ -3368,13 +3511,13 @@ pub async fn run(
                 .as_ref()
                 .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
-                format!("[{now}] {user_input}")
-            } else {
-                format!("{context}[{now}] {user_input}")
-            };
+            let enriched = build_enriched_user_message(
+                &now.to_string(),
+                &mem_context,
+                &hw_context,
+                &user_input,
+            );
 
             if let Some(system_message) = history.first_mut() {
                 if system_message.role == "system" {
@@ -3761,13 +3904,9 @@ pub async fn process_message_with_session(
         .as_ref()
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let enriched = if context.is_empty() {
-        format!("[{now}] {message}")
-    } else {
-        format!("{context}[{now}] {message}")
-    };
+    let enriched =
+        build_enriched_user_message(&now.to_string(), &mem_context, &hw_context, message);
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
@@ -3788,17 +3927,20 @@ pub async fn process_message_with_session(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
             hb_cfg,
-            agent_turn(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                &model_name,
-                config.default_temperature,
-                true,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
+            TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                config.agent.max_context_tokens,
+                agent_turn(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    &model_name,
+                    config.default_temperature,
+                    true,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                ),
             ),
         ),
     )
@@ -7831,5 +7973,30 @@ Let me check the result."#;
         let completed = tracker.render_delta();
         assert!(completed.contains("✅ shell (2s)"));
         assert!(completed.contains("❌ web_search (1s)"));
+    }
+
+    #[test]
+    fn effective_context_budget_uses_model_adaptive_window() {
+        let budget = effective_context_budget(300_000, "nvidia/nemotron-3-super-120b-a12b:free");
+        assert!(budget <= 300_000);
+        assert!(budget >= MIN_ADAPTIVE_CONTEXT_TOKENS);
+        assert_eq!(budget, 178_258);
+    }
+
+    #[test]
+    fn compress_tool_output_for_history_appends_truncation_marker() {
+        let oversized = "x".repeat(TOOL_RESULT_HISTORY_MAX_CHARS + 500);
+        let compressed = compress_tool_output_for_history("shell", &oversized);
+        assert!(compressed.contains("[tool-output-truncated"));
+        assert!(compressed.contains("name=shell"));
+    }
+
+    #[test]
+    fn build_enriched_user_message_caps_total_length() {
+        let mem = "m".repeat(20_000);
+        let hw = "h".repeat(20_000);
+        let user = "u".repeat(20_000);
+        let enriched = build_enriched_user_message("2026-01-01 00:00:00 UTC", &mem, &hw, &user);
+        assert!(enriched.chars().count() <= ENRICHED_CONTEXT_MAX_CHARS);
     }
 }

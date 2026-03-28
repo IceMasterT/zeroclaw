@@ -1,6 +1,8 @@
 use crate::memory::{self, decay, retrieval, Memory, MemoryCategory};
 use crate::util::truncate_with_ellipsis;
 use std::fmt::Write;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Default half-life (days) for time decay in context building.
 const CONTEXT_DECAY_HALF_LIFE_DAYS: f64 = 7.0;
@@ -17,6 +19,9 @@ const CONTEXT_ENTRY_MAX_CHARS: usize = 500;
 
 /// Total chars budget for memory context block.
 const CONTEXT_TOTAL_MAX_CHARS: usize = 3_500;
+const CONTEXT_TOTAL_MAX_TOKENS: usize = 1_100;
+const CONTEXT_CACHE_TTL_SECS: u64 = 20;
+const CONTEXT_CACHE_MAX_ENTRIES: usize = 128;
 
 /// Per-hardware chunk content cap.
 const HARDWARE_CHUNK_MAX_CHARS: usize = 900;
@@ -27,6 +32,46 @@ const HARDWARE_CONTEXT_TOTAL_MAX_CHARS: usize = 4_500;
 /// Over-fetch factor: retrieve more candidates than the output limit so
 /// that Core boost and re-ranking can select the best subset.
 const RECALL_OVER_FETCH_FACTOR: usize = 2;
+
+static MEMORY_CONTEXT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, (Instant, String)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn estimate_tokens_from_chars(chars: usize) -> usize {
+    ((chars as f64) / 4.0).ceil() as usize
+}
+
+fn make_context_cache_key(
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+) -> String {
+    let query = truncate_with_ellipsis(user_msg, 1_024);
+    let sid = session_id.unwrap_or("-");
+    format!("sid={sid}|min={min_relevance_score:.3}|q={query}")
+}
+
+fn cache_get_context(key: &str) -> Option<String> {
+    let cache_ttl = Duration::from_secs(CONTEXT_CACHE_TTL_SECS);
+    let mut cache = MEMORY_CONTEXT_CACHE.lock().ok()?;
+    if let Some((ts, value)) = cache.get(key) {
+        if ts.elapsed() <= cache_ttl {
+            return Some(value.clone());
+        }
+    }
+    cache.remove(key);
+    None
+}
+
+fn cache_put_context(key: String, value: String) {
+    if let Ok(mut cache) = MEMORY_CONTEXT_CACHE.lock() {
+        if cache.len() >= CONTEXT_CACHE_MAX_ENTRIES {
+            if let Some(evict_key) = cache.keys().next().cloned() {
+                cache.remove(&evict_key);
+            }
+        }
+        cache.insert(key, (Instant::now(), value));
+    }
+}
 
 /// Build context preamble by searching memory for relevant entries.
 /// Uses enhanced retrieval (multi-query + Core boosting) for better coverage.
@@ -44,6 +89,11 @@ pub(super) async fn build_context(
     min_relevance_score: f64,
     session_id: Option<&str>,
 ) -> String {
+    let cache_key = make_context_cache_key(user_msg, min_relevance_score, session_id);
+    if let Some(cached) = cache_get_context(&cache_key) {
+        return cached;
+    }
+
     let mut context = String::new();
 
     // Over-fetch so Core-boosted entries can compete fairly after re-ranking.
@@ -77,24 +127,48 @@ pub(super) async fn build_context(
             })
             .collect();
 
-        // Sort by boosted score descending, then truncate to output limit.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(CONTEXT_ENTRY_LIMIT);
+        // Token-aware ranking: prefer high-score concise memories.
+        scored.sort_by(|a, b| {
+            let a_chars = a.0.content.chars().count().max(1) as f64;
+            let b_chars = b.0.content.chars().count().max(1) as f64;
+            let a_utility = a.1 / a_chars.sqrt();
+            let b_utility = b.1 / b_chars.sqrt();
+            b_utility
+                .partial_cmp(&a_utility)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
         if !scored.is_empty() {
             context.push_str("[Memory context]\n");
+            let mut included_entries = 0usize;
+            let mut token_budget_used = estimate_tokens_from_chars(context.chars().count());
             for (entry, _) in &scored {
+                if included_entries >= CONTEXT_ENTRY_LIMIT
+                    || token_budget_used >= CONTEXT_TOTAL_MAX_TOKENS
+                {
+                    break;
+                }
                 let content = truncate_with_ellipsis(&entry.content, CONTEXT_ENTRY_MAX_CHARS);
                 let _ = writeln!(context, "- {}: {}", entry.key, content);
+                included_entries += 1;
+                token_budget_used = estimate_tokens_from_chars(context.chars().count());
                 if context.chars().count() >= CONTEXT_TOTAL_MAX_CHARS {
                     context = truncate_with_ellipsis(&context, CONTEXT_TOTAL_MAX_CHARS);
                     break;
                 }
             }
             context.push('\n');
+            tracing::debug!(
+                entries = included_entries,
+                token_budget_used,
+                token_budget_max = CONTEXT_TOTAL_MAX_TOKENS,
+                "built memory context section"
+            );
         }
     }
 
+    cache_put_context(cache_key, context.clone());
     context
 }
 
