@@ -1,4 +1,5 @@
 use crate::memory::{self, decay, retrieval, Memory, MemoryCategory};
+use crate::util::truncate_with_ellipsis;
 use std::fmt::Write;
 
 /// Default half-life (days) for time decay in context building.
@@ -10,6 +11,18 @@ const CORE_CATEGORY_SCORE_BOOST: f64 = 0.3;
 
 /// Maximum number of memory entries included in the context preamble.
 const CONTEXT_ENTRY_LIMIT: usize = 5;
+
+/// Per-entry content cap to avoid oversized memory preambles.
+const CONTEXT_ENTRY_MAX_CHARS: usize = 500;
+
+/// Total chars budget for memory context block.
+const CONTEXT_TOTAL_MAX_CHARS: usize = 3_500;
+
+/// Per-hardware chunk content cap.
+const HARDWARE_CHUNK_MAX_CHARS: usize = 900;
+
+/// Total chars budget for hardware context block.
+const HARDWARE_CONTEXT_TOTAL_MAX_CHARS: usize = 4_500;
 
 /// Over-fetch factor: retrieve more candidates than the output limit so
 /// that Core boost and re-ranking can select the best subset.
@@ -71,7 +84,12 @@ pub(super) async fn build_context(
         if !scored.is_empty() {
             context.push_str("[Memory context]\n");
             for (entry, _) in &scored {
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+                let content = truncate_with_ellipsis(&entry.content, CONTEXT_ENTRY_MAX_CHARS);
+                let _ = writeln!(context, "- {}: {}", entry.key, content);
+                if context.chars().count() >= CONTEXT_TOTAL_MAX_CHARS {
+                    context = truncate_with_ellipsis(&context, CONTEXT_TOTAL_MAX_CHARS);
+                    break;
+                }
             }
             context.push('\n');
         }
@@ -110,11 +128,16 @@ pub(super) fn build_hardware_context(
     }
     for chunk in chunks {
         let board_tag = chunk.board.as_deref().unwrap_or("generic");
+        let content = truncate_with_ellipsis(&chunk.content, HARDWARE_CHUNK_MAX_CHARS);
         let _ = writeln!(
             context,
             "--- {} ({}) ---\n{}\n",
-            chunk.source, board_tag, chunk.content
+            chunk.source, board_tag, content
         );
+        if context.chars().count() >= HARDWARE_CONTEXT_TOTAL_MAX_CHARS {
+            context = truncate_with_ellipsis(&context, HARDWARE_CONTEXT_TOTAL_MAX_CHARS);
+            break;
+        }
     }
     context.push('\n');
     context

@@ -1048,13 +1048,20 @@ pub struct AgentConfig {
     pub compact_context: bool,
     #[serde(default)]
     pub session: AgentSessionConfig,
-    /// Maximum tool-call loop turns per user message. Default: `20`.
-    /// Setting to `0` falls back to the safe default of `20`.
+    /// Maximum tool-call loop turns per user message. Default: `10`.
+    /// Setting to `0` falls back to the safe default of `10`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// Soft ceiling for LLM input context per request (estimated tokens).
+    ///
+    /// The agent trims oldest history and long message payloads before each
+    /// provider call to stay under this budget and reduce context-window
+    /// overflows. Default: `180000`.
+    #[serde(default = "default_agent_max_context_tokens")]
+    pub max_context_tokens: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
@@ -1148,11 +1155,15 @@ pub struct AgentSessionConfig {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    20
+    10
 }
 
 fn default_agent_max_history_messages() -> usize {
     50
+}
+
+fn default_agent_max_context_tokens() -> usize {
+    180_000
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -1202,6 +1213,7 @@ impl Default for AgentConfig {
             session: AgentSessionConfig::default(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             allowed_tools: Vec::new(),
@@ -4064,11 +4076,11 @@ pub struct ReliabilityConfig {
 }
 
 fn default_provider_retries() -> u32 {
-    2
+    1
 }
 
 fn default_provider_backoff_ms() -> u64 {
-    500
+    250
 }
 
 fn default_channel_backoff_secs() -> u64 {
@@ -4517,7 +4529,7 @@ pub struct ChannelsConfig {
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
     /// entire conversation budget.
-    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
+    /// Default: 120s for a faster fail-fast channel experience.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
 }
@@ -4635,7 +4647,7 @@ impl ChannelsConfig {
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
-    300
+    120
 }
 
 impl Default for ChannelsConfig {
@@ -10788,8 +10800,9 @@ reasoning_level = "high"
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 20);
+        assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
+        assert_eq!(cfg.max_context_tokens, 180_000);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert!(cfg.allowed_tools.is_empty());
@@ -10804,6 +10817,7 @@ default_temperature = 0.7
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
+max_context_tokens = 120000
 parallel_tools = true
 tool_dispatcher = "xml"
 allowed_tools = ["delegate", "task_plan"]
@@ -10813,6 +10827,7 @@ denied_tools = ["shell"]
         assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
+        assert_eq!(parsed.agent.max_context_tokens, 120000);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(

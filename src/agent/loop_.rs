@@ -60,7 +60,7 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
+const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 /// Maximum continuation retries when a provider reports max-token truncation.
 const MAX_TOKENS_CONTINUATION_MAX_ATTEMPTS: usize = 3;
@@ -369,7 +369,15 @@ tokio::task_local! {
     static SAFETY_HEARTBEAT_CONFIG: Option<SafetyHeartbeatConfig>;
     static TOOL_LOOP_PROGRESS_MODE: ProgressMode;
     static TOOL_LOOP_COST_ENFORCEMENT_CONTEXT: Option<CostEnforcementContext>;
+    static TOOL_LOOP_MAX_CONTEXT_TOKENS: usize;
 }
+
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 180_000;
+const CONTEXT_TOKEN_HEADROOM: usize = 8_192;
+const CONTEXT_MIN_NON_SYSTEM_MESSAGES: usize = 8;
+const CONTEXT_MAX_MESSAGE_CHARS: usize = 3_000;
+const CONTEXT_TRIM_SUMMARY_MAX_SOURCE_CHARS: usize = 8_000;
+const CONTEXT_TRIM_SUMMARY_MAX_CHARS: usize = 1_200;
 
 /// Configuration for periodic safety-constraint re-injection (heartbeat).
 #[derive(Clone)]
@@ -513,6 +521,97 @@ fn estimate_request_cost_usd(
     let input_cost = (input_tokens as f64 / 1_000_000.0) * input_price.max(0.0);
     let output_cost = (output_tokens as f64 / 1_000_000.0) * output_price.max(0.0);
     input_cost + output_cost
+}
+
+fn enforce_context_budget(
+    messages: &mut Vec<ChatMessage>,
+    tools: Option<&[crate::tools::ToolSpec]>,
+    max_tokens: usize,
+) -> (u64, u64, usize, usize, bool) {
+    let before = estimate_prompt_tokens(messages, tools);
+    if max_tokens == 0 || before <= max_tokens as u64 {
+        return (before, before, 0, 0, false);
+    }
+
+    let target_tokens = max_tokens.saturating_sub(CONTEXT_TOKEN_HEADROOM) as u64;
+    let has_system = messages.first().is_some_and(|msg| msg.role == "system");
+    let min_total_messages = if has_system {
+        CONTEXT_MIN_NON_SYSTEM_MESSAGES + 1
+    } else {
+        CONTEXT_MIN_NON_SYSTEM_MESSAGES
+    };
+
+    let mut removed_messages = 0usize;
+    let mut truncated_messages = 0usize;
+    let mut summary_inserted = false;
+    let mut removed_transcript = String::new();
+
+    let mut current = estimate_prompt_tokens(messages, tools);
+    while current > target_tokens && messages.len() > min_total_messages {
+        let start = if has_system { 1 } else { 0 };
+        if start >= messages.len() {
+            break;
+        }
+        let mut trim_end = start + 1;
+        while trim_end < messages.len() && messages[trim_end].role == "tool" {
+            trim_end += 1;
+        }
+        for msg in messages[start..trim_end].iter() {
+            if removed_transcript.chars().count() >= CONTEXT_TRIM_SUMMARY_MAX_SOURCE_CHARS {
+                break;
+            }
+            let line = format!("{}: {}\n", msg.role.to_uppercase(), msg.content.trim());
+            removed_transcript.push_str(&truncate_with_ellipsis(
+                &line,
+                CONTEXT_TRIM_SUMMARY_MAX_SOURCE_CHARS,
+            ));
+        }
+        removed_messages += trim_end - start;
+        messages.drain(start..trim_end);
+        current = estimate_prompt_tokens(messages, tools);
+    }
+
+    if !removed_transcript.trim().is_empty() {
+        let has_system = messages.first().is_some_and(|msg| msg.role == "system");
+        let insert_at = if has_system { 1 } else { 0 };
+        let summary = truncate_with_ellipsis(&removed_transcript, CONTEXT_TRIM_SUMMARY_MAX_CHARS);
+        if !summary.trim().is_empty() {
+            messages.insert(
+                insert_at,
+                ChatMessage::assistant(format!("[Context trim summary]\n{}", summary.trim())),
+            );
+            summary_inserted = true;
+            current = estimate_prompt_tokens(messages, tools);
+        }
+    }
+
+    if current > target_tokens {
+        let start = if has_system { 1 } else { 0 };
+        let keep_recent_from = messages.len().saturating_sub(4);
+        for idx in start..keep_recent_from {
+            if current <= target_tokens {
+                break;
+            }
+            let msg = &messages[idx];
+            if msg.role == "tool" {
+                continue;
+            }
+            if msg.content.chars().count() > CONTEXT_MAX_MESSAGE_CHARS {
+                let next_content = truncate_with_ellipsis(&msg.content, CONTEXT_MAX_MESSAGE_CHARS);
+                messages[idx].content = next_content;
+                truncated_messages += 1;
+                current = estimate_prompt_tokens(messages, tools);
+            }
+        }
+    }
+
+    (
+        before,
+        current,
+        removed_messages,
+        truncated_messages,
+        summary_inserted,
+    )
 }
 
 fn usage_period_label(period: UsagePeriod) -> &'static str {
@@ -999,23 +1098,26 @@ pub(crate) async fn agent_turn(
     TOOL_LOOP_CANARY_TOKENS_ENABLED
         .scope(
             false,
-            run_tool_call_loop(
-                provider,
-                history,
-                tools_registry,
-                observer,
-                provider_name,
-                model,
-                temperature,
-                silent,
-                None,
-                "channel",
-                multimodal_config,
-                max_tool_iterations,
-                None,
-                None,
-                None,
-                &[],
+            TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                DEFAULT_MAX_CONTEXT_TOKENS,
+                run_tool_call_loop(
+                    provider,
+                    history,
+                    tools_registry,
+                    observer,
+                    provider_name,
+                    model,
+                    temperature,
+                    silent,
+                    None,
+                    "channel",
+                    multimodal_config,
+                    max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
             ),
         )
         .await
@@ -1051,23 +1153,26 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
                 false,
                 TOOL_LOOP_REPLY_TARGET.scope(
                     reply_target.map(str::to_string),
-                    run_tool_call_loop(
-                        provider,
-                        history,
-                        tools_registry,
-                        observer,
-                        provider_name,
-                        model,
-                        temperature,
-                        silent,
-                        approval,
-                        channel_name,
-                        multimodal_config,
-                        max_tool_iterations,
-                        cancellation_token,
-                        on_delta,
-                        hooks,
-                        excluded_tools,
+                    TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                        DEFAULT_MAX_CONTEXT_TOKENS,
+                        run_tool_call_loop(
+                            provider,
+                            history,
+                            tools_registry,
+                            observer,
+                            provider_name,
+                            model,
+                            temperature,
+                            silent,
+                            approval,
+                            channel_name,
+                            multimodal_config,
+                            max_tool_iterations,
+                            cancellation_token,
+                            on_delta,
+                            hooks,
+                            excluded_tools,
+                        ),
                     ),
                 ),
             ),
@@ -1114,23 +1219,26 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
                         non_cli_approval_context,
                         TOOL_LOOP_REPLY_TARGET.scope(
                             reply_target,
-                            run_tool_call_loop(
-                                provider,
-                                history,
-                                tools_registry,
-                                observer,
-                                provider_name,
-                                model,
-                                temperature,
-                                silent,
-                                approval,
-                                channel_name,
-                                multimodal_config,
-                                max_tool_iterations,
-                                cancellation_token,
-                                on_delta,
-                                hooks,
-                                excluded_tools,
+                            TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                                DEFAULT_MAX_CONTEXT_TOKENS,
+                                run_tool_call_loop(
+                                    provider,
+                                    history,
+                                    tools_registry,
+                                    observer,
+                                    provider_name,
+                                    model,
+                                    temperature,
+                                    silent,
+                                    approval,
+                                    channel_name,
+                                    multimodal_config,
+                                    max_tool_iterations,
+                                    cancellation_token,
+                                    on_delta,
+                                    hooks,
+                                    excluded_tools,
+                                ),
                             ),
                         ),
                     ),
@@ -1303,11 +1411,98 @@ pub async fn run_tool_call_loop(
         }
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
+        let mut request_tools = if use_native_tools {
             Some(tool_specs.as_slice())
         } else {
             None
         };
+
+        let max_context_tokens = TOOL_LOOP_MAX_CONTEXT_TOKENS
+            .try_with(|value| *value)
+            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
+        let (
+            tokens_before_trim,
+            mut tokens_after_trim,
+            removed_msgs,
+            truncated_msgs,
+            summary_inserted,
+        ) = enforce_context_budget(&mut request_messages, request_tools, max_context_tokens);
+
+        if tokens_after_trim > max_context_tokens as u64 && request_tools.is_some() {
+            request_tools = None;
+            tokens_after_trim = estimate_prompt_tokens(&request_messages, request_tools);
+            runtime_trace::record_event(
+                "context_budget_dropped_native_tools",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(true),
+                Some("dropped native tool schema payload to fit context budget"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "tokens_before_trim": tokens_before_trim,
+                    "tokens_after_trim": tokens_after_trim,
+                    "max_context_tokens": max_context_tokens,
+                }),
+            );
+        }
+
+        if tokens_after_trim > max_context_tokens as u64 {
+            let reason = format!(
+                "Estimated context ({tokens_after_trim} tokens) exceeds configured budget ({max_context_tokens}). Try lowering memory/context load or increasing agent.max_context_tokens."
+            );
+            runtime_trace::record_event(
+                "context_budget_exceeded",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(false),
+                Some(&reason),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "tokens_before_trim": tokens_before_trim,
+                    "tokens_after_trim": tokens_after_trim,
+                    "max_context_tokens": max_context_tokens,
+                    "removed_messages": removed_msgs,
+                    "truncated_messages": truncated_msgs,
+                    "summary_inserted": summary_inserted,
+                }),
+            );
+            return Err(anyhow::anyhow!(reason));
+        }
+
+        if removed_msgs > 0 || truncated_msgs > 0 || summary_inserted {
+            tracing::warn!(
+                iteration = iteration + 1,
+                tokens_before_trim,
+                tokens_after_trim,
+                max_context_tokens,
+                removed_messages = removed_msgs,
+                truncated_messages = truncated_msgs,
+                summary_inserted,
+                "Applied context-budget trimming before provider request"
+            );
+            runtime_trace::record_event(
+                "context_budget_trim",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(true),
+                Some("trimmed request history to stay within context budget"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "tokens_before_trim": tokens_before_trim,
+                    "tokens_after_trim": tokens_after_trim,
+                    "max_context_tokens": max_context_tokens,
+                    "removed_messages": removed_msgs,
+                    "truncated_messages": truncated_msgs,
+                    "summary_inserted": summary_inserted,
+                }),
+            );
+        }
 
         // ── Progress: LLM thinking ────────────────────────────
         if should_emit_verbose_progress(progress_mode) {
@@ -2992,23 +3187,26 @@ pub async fn run(
                     ld_cfg,
                     TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
                         config.security.canary_tokens,
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            provider_name,
-                            &model_name,
-                            temperature,
-                            false,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            None,
-                            None,
-                            effective_hooks,
-                            &[],
+                        TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                            config.agent.max_context_tokens,
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                provider_name,
+                                &model_name,
+                                temperature,
+                                false,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                None,
+                                None,
+                                effective_hooks,
+                                &[],
+                            ),
                         ),
                     ),
                 ),
@@ -3221,23 +3419,26 @@ pub async fn run(
                         ld_cfg,
                         TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
                             config.security.canary_tokens,
-                            run_tool_call_loop(
-                                provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                provider_name,
-                                &model_name,
-                                temperature,
-                                false,
-                                approval_manager.as_ref(),
-                                channel_name,
-                                &config.multimodal,
-                                config.agent.max_tool_iterations,
-                                None,
-                                None,
-                                effective_hooks,
-                                &[],
+                            TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
+                                config.agent.max_context_tokens,
+                                run_tool_call_loop(
+                                    provider.as_ref(),
+                                    &mut history,
+                                    &tools_registry,
+                                    observer.as_ref(),
+                                    provider_name,
+                                    &model_name,
+                                    temperature,
+                                    false,
+                                    approval_manager.as_ref(),
+                                    channel_name,
+                                    &config.multimodal,
+                                    config.agent.max_tool_iterations,
+                                    None,
+                                    None,
+                                    effective_hooks,
+                                    &[],
+                                ),
                             ),
                         ),
                     ),
