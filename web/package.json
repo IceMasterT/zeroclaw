@@ -11,7 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:mobile-smoke": "node ./scripts/mobile-smoke-runner.mjs",
-    "desktop:dev": "tauri dev",
+    "desktop:dev": "tauri dev --no-dev-server-wait",
     "desktop:build": "tauri build"
   },
   "dependencies": {
