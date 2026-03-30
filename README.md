@@ -124,6 +124,19 @@ zeroclaw gateway
 zeroclaw chat "Hello!"
 ```
 
+### Desktop App (Preview)
+
+ZeroClaw now includes a desktop wrapper (Tauri) under `web/src-tauri`.
+
+```bash
+cd web
+npm install
+npm run desktop:dev
+```
+
+This launches a native window and starts `zeroclaw gateway --host 127.0.0.1 --port 9573` in the background.
+If `zeroclaw` is not on PATH, set `ZEROCLAW_BIN=/path/to/zeroclaw` before launching.
+
 For detailed setup options, see [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md).
 
 ### Installation Docs (Canonical Source)
