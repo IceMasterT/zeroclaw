@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:mobile-smoke": "node ./scripts/mobile-smoke-runner.mjs",
-    "desktop:dev": "tauri dev --no-dev-server-wait",
+    "desktop:dev": "tauri dev --no-dev-server-wait --no-watch",
+    "desktop:fast": "cargo run --manifest-path src-tauri/Cargo.toml --release",
     "desktop:build": "tauri build"
   },
   "dependencies": {

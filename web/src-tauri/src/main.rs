@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager};
 const GATEWAY_HOST: &str = "127.0.0.1";
 const GATEWAY_PORT: u16 = 9573;
 const GATEWAY_BOOT_TIMEOUT_SECS: u64 = 20;
+const GATEWAY_ATTACH_TIMEOUT_SECS: u64 = 3;
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -16,17 +17,17 @@ fn gateway_addr() -> String {
     format!("http://{GATEWAY_HOST}:{GATEWAY_PORT}")
 }
 
-fn wait_for_gateway_ready() -> io::Result<()> {
+fn wait_for_gateway_ready(timeout: Duration) -> io::Result<()> {
     let start = Instant::now();
     let addr: SocketAddr = format!("{GATEWAY_HOST}:{GATEWAY_PORT}")
         .parse()
         .map_err(io::Error::other)?;
 
-    while start.elapsed() < Duration::from_secs(GATEWAY_BOOT_TIMEOUT_SECS) {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(120));
     }
 
     Err(io::Error::new(
@@ -60,12 +61,27 @@ fn kill_gateway(child: &SharedChild) {
 }
 
 fn start_gateway_with_fallback(app: &AppHandle, child: &SharedChild) {
-    match spawn_gateway().and_then(|process| {
-        if let Ok(mut guard) = child.lock() {
-            *guard = Some(process);
-        }
-        wait_for_gateway_ready()
-    }) {
+    let existing_gateway = wait_for_gateway_ready(Duration::from_secs(GATEWAY_ATTACH_TIMEOUT_SECS));
+    let startup_result = if existing_gateway.is_ok() {
+        Ok(())
+    } else {
+        spawn_gateway()
+            .and_then(|process| {
+                if let Ok(mut guard) = child.lock() {
+                    *guard = Some(process);
+                }
+                wait_for_gateway_ready(Duration::from_secs(GATEWAY_BOOT_TIMEOUT_SECS))
+            })
+            .or_else(|spawn_error| {
+                // If launch failed because a gateway was starting concurrently,
+                // attempt attach before surfacing an error.
+                wait_for_gateway_ready(Duration::from_secs(GATEWAY_ATTACH_TIMEOUT_SECS))
+                    .map(|_| ())
+                    .map_err(|_| spawn_error)
+            })
+    };
+
+    match startup_result {
         Ok(()) => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.eval(&format!("window.location.replace({:?});", gateway_addr()));
