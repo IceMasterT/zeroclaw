@@ -128,6 +128,12 @@ zeroclaw chat "Hello!"
 
 ZeroClaw now includes a desktop wrapper (Tauri) under `web/src-tauri`.
 
+Quick connect (recommended):
+
+```bash
+./scripts/desktop-connect.sh
+```
+
 ```bash
 cd web
 npm install
