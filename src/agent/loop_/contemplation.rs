@@ -1,9 +1,31 @@
 use crate::config::Config;
 use crate::util::truncate_with_ellipsis;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
+
+const MIN_CONTEMPLATION_CHARS: usize = 72;
+
+static RISK_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(delete|drop|destroy|production|irreversible|downtime|outage|shutdown|revoke|migrate|rollback|deploy)\b")
+        .expect("risk keyword regex must compile")
+});
+
+fn should_run_contemplation(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if RISK_KEYWORD_RE.is_match(trimmed) {
+        return true;
+    }
+
+    trimmed.chars().count() >= MIN_CONTEMPLATION_CHARS
+}
 
 #[derive(Debug, Serialize)]
 struct BridgeRequest<'a> {
@@ -25,6 +47,10 @@ pub(super) async fn enhance_message_with_contemplation(
 ) -> String {
     let bridge = &config.contemplation;
     if !bridge.enabled {
+        return message;
+    }
+
+    if !should_run_contemplation(&message) {
         return message;
     }
 
