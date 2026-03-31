@@ -260,6 +260,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Optional Contemplation Core bridge settings (`[contemplation]`).
+    #[serde(default)]
+    pub contemplation: ContemplationConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -1152,6 +1156,45 @@ pub struct AgentSessionConfig {
     /// Default: 50.
     #[serde(default = "default_agent_session_max_messages")]
     pub max_messages: usize,
+}
+
+/// Optional external contemplation bridge configuration (`[contemplation]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContemplationConfig {
+    /// Enable contemplation bridge processing before agent response planning.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shell command to execute the contemplation bridge.
+    ///
+    /// The command receives JSON on stdin and may return either a plain-text
+    /// enhanced prompt or JSON `{ "message": "..." }` on stdout.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Timeout for bridge execution in milliseconds.
+    #[serde(default = "default_contemplation_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum accepted output size from bridge in UTF-8 characters.
+    #[serde(default = "default_contemplation_max_output_chars")]
+    pub max_output_chars: usize,
+}
+
+fn default_contemplation_timeout_ms() -> u64 {
+    1500
+}
+
+fn default_contemplation_max_output_chars() -> usize {
+    14_000
+}
+
+impl Default for ContemplationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: None,
+            timeout_ms: default_contemplation_timeout_ms(),
+            max_output_chars: default_contemplation_max_output_chars(),
+        }
+    }
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -6566,6 +6609,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            contemplation: ContemplationConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),

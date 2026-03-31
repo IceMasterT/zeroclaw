@@ -33,12 +33,14 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod contemplation;
 mod context;
 pub(crate) mod detection;
 mod execution;
 pub(crate) mod history;
 mod parsing;
 
+use contemplation::enhance_message_with_contemplation;
 use context::{build_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
@@ -3303,6 +3305,8 @@ pub async fn run(
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched =
             build_enriched_user_message(&now.to_string(), &mem_context, &hw_context, &msg);
+        let enriched =
+            enhance_message_with_contemplation(&config, Some("main"), channel_name, enriched).await;
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
@@ -3518,6 +3522,9 @@ pub async fn run(
                 &hw_context,
                 &user_input,
             );
+            let enriched =
+                enhance_message_with_contemplation(&config, Some("main"), channel_name, enriched)
+                    .await;
 
             if let Some(system_message) = history.first_mut() {
                 if system_message.role == "system" {
@@ -3907,6 +3914,8 @@ pub async fn process_message_with_session(
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let enriched =
         build_enriched_user_message(&now.to_string(), &mem_context, &hw_context, message);
+    let enriched =
+        enhance_message_with_contemplation(&config, session_id, "direct", enriched).await;
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),

@@ -1,7 +1,7 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NapcatConfig,
-    NextcloudTalkConfig, NostrConfig, ProgressMode, QQConfig, QQEnvironment, QQReceiveMode,
-    SignalConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, ContemplationConfig, DingTalkConfig, IrcConfig, LarkReceiveMode,
+    LinqConfig, NapcatConfig, NextcloudTalkConfig, NostrConfig, ProgressMode, QQConfig,
+    QQEnvironment, QQReceiveMode, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -260,6 +260,7 @@ pub async fn run_wizard_with_migration(
         scheduler: crate::config::schema::SchedulerConfig::default(),
         coordination: crate::config::CoordinationConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        contemplation: ContemplationConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -776,6 +777,7 @@ async fn run_quick_setup_with_home(
         scheduler: crate::config::schema::SchedulerConfig::default(),
         coordination: crate::config::CoordinationConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        contemplation: ContemplationConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
