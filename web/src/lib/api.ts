@@ -74,6 +74,42 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
   return value as T;
 }
 
+function normalizeMemoryCategory(raw: unknown): string {
+  if (typeof raw === 'string') {
+    return raw;
+  }
+  if (raw && typeof raw === 'object') {
+    const custom = (raw as Record<string, unknown>).custom;
+    if (typeof custom === 'string' && custom.trim().length > 0) {
+      return custom;
+    }
+  }
+  return 'unknown';
+}
+
+function normalizeMemoryEntry(raw: unknown): MemoryEntry {
+  const entry = (raw ?? {}) as Record<string, unknown>;
+  const key = typeof entry.key === 'string' ? entry.key : '';
+  const category = normalizeMemoryCategory(entry.category);
+  const fallbackId = `${key || 'memory'}:${category}`;
+  return {
+    id: typeof entry.id === 'string' && entry.id.length > 0 ? entry.id : fallbackId,
+    key,
+    content: typeof entry.content === 'string' ? entry.content : String(entry.content ?? ''),
+    category,
+    timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : '',
+    session_id: typeof entry.session_id === 'string' ? entry.session_id : null,
+    score: typeof entry.score === 'number' ? entry.score : null,
+  };
+}
+
+function normalizeMemoryEntries(raw: unknown): MemoryEntry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((entry) => normalizeMemoryEntry(entry));
+}
+
 // ---------------------------------------------------------------------------
 // Pairing
 // ---------------------------------------------------------------------------
@@ -226,9 +262,9 @@ export function getMemory(
   if (query) params.set('query', query);
   if (category) params.set('category', category);
   const qs = params.toString();
-  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
-    (data) => unwrapField(data, 'entries'),
-  );
+  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(
+    `/api/memory${qs ? `?${qs}` : ''}`,
+  ).then((data) => normalizeMemoryEntries(unwrapField(data, 'entries')));
 }
 
 export function storeMemory(
