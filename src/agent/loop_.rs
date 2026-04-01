@@ -373,6 +373,8 @@ tokio::task_local! {
     static TOOL_LOOP_PROGRESS_MODE: ProgressMode;
     static TOOL_LOOP_COST_ENFORCEMENT_CONTEXT: Option<CostEnforcementContext>;
     static TOOL_LOOP_MAX_CONTEXT_TOKENS: usize;
+    static TOOL_LOOP_TURBO_MODE: bool;
+    static TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS: usize;
 }
 
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 180_000;
@@ -385,6 +387,7 @@ const TOOL_RESULT_HISTORY_MAX_CHARS: usize = 2_000;
 const MIN_ADAPTIVE_CONTEXT_TOKENS: usize = 24_000;
 const USER_MESSAGE_MAX_CHARS: usize = 8_000;
 const ENRICHED_CONTEXT_MAX_CHARS: usize = 14_000;
+const TURBO_FALLBACK_MAX_TOOL_ITERATIONS: usize = 4;
 
 /// Configuration for periodic safety-constraint re-injection (heartbeat).
 #[derive(Clone)]
@@ -690,6 +693,56 @@ fn compress_tool_output_for_history(tool_name: &str, output: &str) -> String {
     format!(
         "{preview}\n\n[tool-output-truncated name={tool_name} total_chars={char_count} digest={digest:016x}]"
     )
+}
+
+fn latest_user_content(messages: &[ChatMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == "user")
+        .map(|msg| msg.content.as_str())
+}
+
+fn should_hide_tools_in_turbo(messages: &[ChatMessage]) -> bool {
+    let Some(user_text) = latest_user_content(messages) else {
+        return false;
+    };
+
+    let trimmed = user_text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Keep tool access for likely tooling/high-risk turns.
+    let keep_keywords = [
+        "run",
+        "execute",
+        "shell",
+        "bash",
+        "command",
+        "file",
+        "edit",
+        "write",
+        "read",
+        "search",
+        "grep",
+        "git",
+        "deploy",
+        "delete",
+        "production",
+        "rollback",
+        "api",
+        "http",
+        "webhook",
+        "database",
+        "sql",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    if keep_keywords.iter().any(|kw| lower.contains(kw)) {
+        return false;
+    }
+
+    trimmed.chars().count() <= 180
 }
 
 fn build_enriched_user_message(
@@ -1209,23 +1262,29 @@ pub(crate) async fn agent_turn(
             false,
             TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                 DEFAULT_MAX_CONTEXT_TOKENS,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    None,
-                    "channel",
-                    multimodal_config,
-                    max_tool_iterations,
-                    None,
-                    None,
-                    None,
-                    &[],
+                TOOL_LOOP_TURBO_MODE.scope(
+                    false,
+                    TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                        TURBO_FALLBACK_MAX_TOOL_ITERATIONS,
+                        run_tool_call_loop(
+                            provider,
+                            history,
+                            tools_registry,
+                            observer,
+                            provider_name,
+                            model,
+                            temperature,
+                            silent,
+                            None,
+                            "channel",
+                            multimodal_config,
+                            max_tool_iterations,
+                            None,
+                            None,
+                            None,
+                            &[],
+                        ),
+                    ),
                 ),
             ),
         )
@@ -1264,23 +1323,29 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
                     reply_target.map(str::to_string),
                     TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                         DEFAULT_MAX_CONTEXT_TOKENS,
-                        run_tool_call_loop(
-                            provider,
-                            history,
-                            tools_registry,
-                            observer,
-                            provider_name,
-                            model,
-                            temperature,
-                            silent,
-                            approval,
-                            channel_name,
-                            multimodal_config,
-                            max_tool_iterations,
-                            cancellation_token,
-                            on_delta,
-                            hooks,
-                            excluded_tools,
+                        TOOL_LOOP_TURBO_MODE.scope(
+                            false,
+                            TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                                TURBO_FALLBACK_MAX_TOOL_ITERATIONS,
+                                run_tool_call_loop(
+                                    provider,
+                                    history,
+                                    tools_registry,
+                                    observer,
+                                    provider_name,
+                                    model,
+                                    temperature,
+                                    silent,
+                                    approval,
+                                    channel_name,
+                                    multimodal_config,
+                                    max_tool_iterations,
+                                    cancellation_token,
+                                    on_delta,
+                                    hooks,
+                                    excluded_tools,
+                                ),
+                            ),
                         ),
                     ),
                 ),
@@ -1330,23 +1395,29 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
                             reply_target,
                             TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                                 DEFAULT_MAX_CONTEXT_TOKENS,
-                                run_tool_call_loop(
-                                    provider,
-                                    history,
-                                    tools_registry,
-                                    observer,
-                                    provider_name,
-                                    model,
-                                    temperature,
-                                    silent,
-                                    approval,
-                                    channel_name,
-                                    multimodal_config,
-                                    max_tool_iterations,
-                                    cancellation_token,
-                                    on_delta,
-                                    hooks,
-                                    excluded_tools,
+                                TOOL_LOOP_TURBO_MODE.scope(
+                                    false,
+                                    TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                                        TURBO_FALLBACK_MAX_TOOL_ITERATIONS,
+                                        run_tool_call_loop(
+                                            provider,
+                                            history,
+                                            tools_registry,
+                                            observer,
+                                            provider_name,
+                                            model,
+                                            temperature,
+                                            silent,
+                                            approval,
+                                            channel_name,
+                                            multimodal_config,
+                                            max_tool_iterations,
+                                            cancellation_token,
+                                            on_delta,
+                                            hooks,
+                                            excluded_tools,
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
@@ -1408,6 +1479,18 @@ pub async fn run_tool_call_loop(
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
+    };
+    let turbo_mode = TOOL_LOOP_TURBO_MODE
+        .try_with(|value| *value)
+        .unwrap_or(false);
+    let turbo_max_iterations = TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS
+        .try_with(|value| *value)
+        .unwrap_or(TURBO_FALLBACK_MAX_TOOL_ITERATIONS)
+        .max(1);
+    let max_iterations = if turbo_mode {
+        max_iterations.min(turbo_max_iterations)
+    } else {
+        max_iterations
     };
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
@@ -1526,11 +1609,24 @@ pub async fn run_tool_call_loop(
         }
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let mut request_tools = if use_native_tools {
+        let hide_tools_for_turbo = turbo_mode && should_hide_tools_in_turbo(&request_messages);
+        let mut request_tools = if use_native_tools && !hide_tools_for_turbo {
             Some(tool_specs.as_slice())
         } else {
             None
         };
+        if hide_tools_for_turbo {
+            runtime_trace::record_event(
+                "turbo_mode_tools_hidden",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model.as_str()),
+                Some(&turn_id),
+                Some(true),
+                Some("hid native tool schema for simple turbo turn"),
+                serde_json::json!({ "iteration": iteration + 1 }),
+            );
+        }
 
         let model_adaptive_budget =
             effective_context_budget(dynamic_max_context_tokens, &active_model);
@@ -3336,23 +3432,29 @@ pub async fn run(
                         config.security.canary_tokens,
                         TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                             config.agent.max_context_tokens,
-                            run_tool_call_loop(
-                                provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                provider_name,
-                                &model_name,
-                                temperature,
-                                false,
-                                approval_manager.as_ref(),
-                                channel_name,
-                                &config.multimodal,
-                                config.agent.max_tool_iterations,
-                                None,
-                                None,
-                                effective_hooks,
-                                &[],
+                            TOOL_LOOP_TURBO_MODE.scope(
+                                config.agent.turbo_mode,
+                                TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                                    config.agent.turbo_max_tool_iterations,
+                                    run_tool_call_loop(
+                                        provider.as_ref(),
+                                        &mut history,
+                                        &tools_registry,
+                                        observer.as_ref(),
+                                        provider_name,
+                                        &model_name,
+                                        temperature,
+                                        false,
+                                        approval_manager.as_ref(),
+                                        channel_name,
+                                        &config.multimodal,
+                                        config.agent.max_tool_iterations,
+                                        None,
+                                        None,
+                                        effective_hooks,
+                                        &[],
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -3571,23 +3673,29 @@ pub async fn run(
                             config.security.canary_tokens,
                             TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                                 config.agent.max_context_tokens,
-                                run_tool_call_loop(
-                                    provider.as_ref(),
-                                    &mut history,
-                                    &tools_registry,
-                                    observer.as_ref(),
-                                    provider_name,
-                                    &model_name,
-                                    temperature,
-                                    false,
-                                    approval_manager.as_ref(),
-                                    channel_name,
-                                    &config.multimodal,
-                                    config.agent.max_tool_iterations,
-                                    None,
-                                    None,
-                                    effective_hooks,
-                                    &[],
+                                TOOL_LOOP_TURBO_MODE.scope(
+                                    config.agent.turbo_mode,
+                                    TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                                        config.agent.turbo_max_tool_iterations,
+                                        run_tool_call_loop(
+                                            provider.as_ref(),
+                                            &mut history,
+                                            &tools_registry,
+                                            observer.as_ref(),
+                                            provider_name,
+                                            &model_name,
+                                            temperature,
+                                            false,
+                                            approval_manager.as_ref(),
+                                            channel_name,
+                                            &config.multimodal,
+                                            config.agent.max_tool_iterations,
+                                            None,
+                                            None,
+                                            effective_hooks,
+                                            &[],
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
@@ -3938,17 +4046,23 @@ pub async fn process_message_with_session(
             hb_cfg,
             TOOL_LOOP_MAX_CONTEXT_TOKENS.scope(
                 config.agent.max_context_tokens,
-                agent_turn(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    provider_name,
-                    &model_name,
-                    config.default_temperature,
-                    true,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
+                TOOL_LOOP_TURBO_MODE.scope(
+                    config.agent.turbo_mode,
+                    TOOL_LOOP_TURBO_MAX_TOOL_ITERATIONS.scope(
+                        config.agent.turbo_max_tool_iterations,
+                        agent_turn(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            config.default_temperature,
+                            true,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                        ),
+                    ),
                 ),
             ),
         ),

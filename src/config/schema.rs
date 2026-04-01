@@ -1115,6 +1115,17 @@ pub struct AgentConfig {
     /// set to `0` for explicit disable.
     #[serde(default = "default_safety_heartbeat_turn_interval")]
     pub safety_heartbeat_turn_interval: usize,
+    /// Enable turbo latency mode.
+    ///
+    /// When enabled, the agent constrains tool-loop depth and may skip exposing
+    /// tool schemas for simple low-risk turns to reduce first-token latency.
+    #[serde(default)]
+    pub turbo_mode: bool,
+    /// Maximum tool-call iterations when `turbo_mode=true`.
+    ///
+    /// Set to `0` to use the built-in turbo default (`4`).
+    #[serde(default = "default_agent_turbo_max_tool_iterations")]
+    pub turbo_max_tool_iterations: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1249,6 +1260,10 @@ fn default_safety_heartbeat_turn_interval() -> usize {
     10
 }
 
+fn default_agent_turbo_max_tool_iterations() -> usize {
+    4
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1268,6 +1283,8 @@ impl Default for AgentConfig {
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
             safety_heartbeat_interval: default_safety_heartbeat_interval(),
             safety_heartbeat_turn_interval: default_safety_heartbeat_turn_interval(),
+            turbo_mode: false,
+            turbo_max_tool_iterations: default_agent_turbo_max_tool_iterations(),
         }
     }
 }
