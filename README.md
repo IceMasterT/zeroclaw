@@ -83,6 +83,24 @@ Fastest path:
 ./scripts/desktop-connect.sh
 ```
 
+By default this enables **easy-bind** for local desktop use:
+- forces `gateway.host=127.0.0.1`
+- sets `gateway.require_pairing=false`
+
+So you will not be prompted for a 6-digit key on localhost.
+
+If you want strict pairing auth instead:
+
+```bash
+./scripts/desktop-connect.sh --require-pairing
+```
+
+Or re-enable globally:
+
+```bash
+./scripts/desktop-secure-bind.sh
+```
+
 Manual path:
 
 ```bash
