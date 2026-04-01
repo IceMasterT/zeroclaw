@@ -25,61 +25,98 @@ if (!original) {
 
 const mode = String(process.env.CC_BRIDGE_MODE ?? 'lite').toLowerCase()
 
+const splitSentences = (text) =>
+  String(text)
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+const hasAny = (text, terms) => terms.some((term) => text.includes(term))
+
+const buildOverlay = ({
+  originalText,
+  depthMode,
+  riskLine,
+  nextStep,
+  assumptions = [],
+  tensions = [],
+  confidenceCap,
+}) => {
+  const lines = [
+    '[Contemplation Core Overlay]',
+    `- depth_mode: ${depthMode}`,
+    '- epistemic_governor: separate knowns vs assumptions',
+    `- risk_and_ethics: ${riskLine}`,
+    `- active_inference_next: ${nextStep}`,
+    Number.isFinite(confidenceCap) ? `- confidence_cap: ${Number(confidenceCap).toFixed(2)}` : null,
+    assumptions.length ? `- assumptions: ${assumptions.join(' | ')}` : null,
+    tensions.length ? `- debate_tensions: ${tensions.join(' | ')}` : null,
+    '',
+    originalText,
+  ].filter(Boolean)
+  return lines.join('\n')
+}
+
 if (mode === 'lite') {
   const riskWords = /(delete|drop|destroy|production|irreversible|downtime|outage|shutdown|revoke)/i
   const needsCaution = riskWords.test(original)
-  const lines = [
-    '[Contemplation Core Overlay]',
-    '- depth_mode: L0_QUICK',
-    '- epistemic_governor: separate knowns vs assumptions',
-    needsCaution
-      ? '- risk_and_ethics: high-impact action detected; require rollback plan + approval'
-      : '- risk_and_ethics: validate assumptions before irreversible actions',
-    '- active_inference_next: ask one uncertainty-reducing question first',
-    '',
-    original,
-  ]
-  process.stdout.write(JSON.stringify({ message: lines.join('\n') }))
+  const overlay = buildOverlay({
+    originalText: original,
+    depthMode: 'L0_QUICK',
+    riskLine: needsCaution
+      ? 'high-impact action detected; require rollback plan + approval'
+      : 'validate assumptions before irreversible actions',
+    nextStep: 'ask one uncertainty-reducing question first',
+  })
+  process.stdout.write(JSON.stringify({ message: overlay }))
   process.exit(0)
 }
 
-let ContemplationCore
-try {
-  ;({ ContemplationCore } = await import('../Contemplation Core/dist/src/index.js'))
-} catch {
-  // Dist not available: graceful passthrough.
-  process.stdout.write(JSON.stringify({ message: original }))
-  process.exit(0)
+// Self-contained "full" mode (no external repo dependency)
+const lower = original.toLowerCase()
+const riskTerms = [
+  'delete', 'drop', 'destroy', 'production', 'irreversible', 'downtime',
+  'outage', 'shutdown', 'revoke', 'deploy', 'migrate', 'rollback', 'database',
+]
+const uncertaintyTerms = ['maybe', 'probably', 'might', 'not sure', 'guess', 'assume']
+const urgencyTerms = ['now', 'immediately', 'asap', 'urgent', 'right away']
+
+const riskHigh = hasAny(lower, riskTerms)
+const uncertaintyHigh = hasAny(lower, uncertaintyTerms)
+const urgencyHigh = hasAny(lower, urgencyTerms)
+
+const depthMode = riskHigh ? 'L2_ANALYTIC' : uncertaintyHigh ? 'L1_STRUCTURED' : 'L0_QUICK'
+const riskLine = riskHigh
+  ? 'high-impact pathway detected; require rollback and staged execution checks'
+  : 'moderate/low impact; verify constraints before execution'
+const nextStep = riskHigh
+  ? 'confirm rollback path + blast radius before any execution'
+  : uncertaintyHigh
+    ? 'ask one clarification question to reduce uncertainty'
+    : 'confirm intended outcome and proceed with smallest reversible step'
+
+const assumptions = []
+if (urgencyHigh) assumptions.push('Urgency may be over-weighting risk tradeoffs')
+if (!/\b(test|staging|dry\s*run|sandbox)\b/.test(lower)) {
+  assumptions.push('Execution environment may be production-like')
 }
+const firstSentence = splitSentences(original)[0]
+if (firstSentence) assumptions.push(`Primary objective: ${firstSentence}`)
 
-const core = new ContemplationCore()
-const sessionId = String(payload.session_id ?? payload.sessionId ?? 'zeroclaw-session')
-const input = { sessionId, message: original }
+const tensions = []
+if (riskHigh && urgencyHigh) tensions.push('Safety vs urgency')
+if (uncertaintyHigh) tensions.push('Confidence vs incomplete information')
 
-let enhanced = original
-try {
-  const result = core.process(input)
-  const keyAssumptions = (result.assumptions ?? []).slice(0, 3)
-  const topTensions = (result.debate?.unresolvedTensions ?? []).slice(0, 2)
-  const nextProbe = result.activeInference?.recommendedAction ?? null
-  const confidenceCap = result.epistemic?.confidenceCap
+const confidenceCap = riskHigh ? 0.65 : uncertaintyHigh ? 0.7 : 0.8
 
-  const lines = [
-    '[Contemplation Core Overlay]',
-    `- depth_mode: ${result.activation?.depthMode ?? 'L0_QUICK'}`,
-    nextProbe ? `- active_inference_next: ${nextProbe}` : null,
-    Number.isFinite(confidenceCap)
-      ? `- confidence_cap: ${Number(confidenceCap).toFixed(2)}`
-      : null,
-    keyAssumptions.length ? `- assumptions: ${keyAssumptions.join(' | ')}` : null,
-    topTensions.length ? `- debate_tensions: ${topTensions.join(' | ')}` : null,
-    '',
-    original,
-  ].filter(Boolean)
-
-  enhanced = lines.join('\n')
-} catch {
-  enhanced = original
-}
+const enhanced = buildOverlay({
+  originalText: original,
+  depthMode,
+  riskLine,
+  nextStep,
+  assumptions: assumptions.slice(0, 3),
+  tensions: tensions.slice(0, 2),
+  confidenceCap,
+})
 
 process.stdout.write(JSON.stringify({ message: enhanced }))

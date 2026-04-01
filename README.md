@@ -185,7 +185,7 @@ max_output_chars = 12000
 Modes:
 
 - `lite`: low-latency safety/epistemic overlay
-- `full`: attempts full Contemplation Core processing (if built artifacts exist)
+- `full`: richer self-contained analysis mode (still local, no external repo dependency)
 
 ---
 
@@ -229,4 +229,3 @@ zeroclaw gateway --host 127.0.0.1 --port 9573
 Dual licensed:
 - MIT (`LICENSE-MIT`)
 - Apache-2.0 (`LICENSE-APACHE`)
-
