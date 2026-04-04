@@ -16,9 +16,9 @@ function truncate(text: string, max: number): string {
 }
 
 function rowKey(entry: MemoryEntry): string {
-  const id = entry.id?.trim();
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
   if (id) return id;
-  return `${entry.key}:${entry.timestamp}:${entry.category}`;
+  return `${String(entry.key)}:${String(entry.timestamp)}:${String(entry.category)}`;
 }
 
 function formatDate(iso: string): string {

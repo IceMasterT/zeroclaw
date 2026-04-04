@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use serde::Serialize;
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -55,6 +56,54 @@ pub struct MemoryQuery {
 
 const DEFAULT_MEMORY_API_LIMIT: usize = 200;
 const MAX_MEMORY_API_LIMIT: usize = 1000;
+const MEMORY_API_MAX_KEY_CHARS: usize = 256;
+const MEMORY_API_MAX_CONTENT_CHARS: usize = 4_000;
+
+#[derive(Serialize)]
+struct MemoryApiEntry {
+    id: String,
+    key: String,
+    content: String,
+    category: String,
+    timestamp: String,
+    session_id: Option<String>,
+    score: Option<f64>,
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn sanitize_memory_entries(
+    mut entries: Vec<crate::memory::MemoryEntry>,
+    limit: usize,
+) -> Vec<MemoryApiEntry> {
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut id = entry.id;
+            if id.trim().is_empty() {
+                id = format!("{}:{}", entry.key, entry.timestamp);
+            }
+            let key = truncate_chars(&entry.key, MEMORY_API_MAX_KEY_CHARS);
+            let content = truncate_chars(&entry.content, MEMORY_API_MAX_CONTENT_CHARS);
+            let category = entry.category.to_string();
+            MemoryApiEntry {
+                id,
+                key,
+                content,
+                category,
+                timestamp: entry.timestamp,
+                session_id: entry.session_id,
+                score: entry.score,
+            }
+        })
+        .collect()
+}
 
 fn bounded_memory_limit(requested: Option<usize>) -> usize {
     requested
@@ -769,10 +818,8 @@ pub async fn handle_api_memory_list(
     if let Some(ref query) = params.query {
         // Search mode
         match state.mem.recall(query, limit, None).await {
-            Ok(mut entries) => {
-                if entries.len() > limit {
-                    entries.truncate(limit);
-                }
+            Ok(entries) => {
+                let entries = sanitize_memory_entries(entries, limit);
                 Json(serde_json::json!({"entries": entries})).into_response()
             }
             Err(e) => (
@@ -791,10 +838,8 @@ pub async fn handle_api_memory_list(
         });
 
         match state.mem.list(category.as_ref(), None).await {
-            Ok(mut entries) => {
-                if entries.len() > limit {
-                    entries.truncate(limit);
-                }
+            Ok(entries) => {
+                let entries = sanitize_memory_entries(entries, limit);
                 Json(serde_json::json!({"entries": entries})).into_response()
             }
             Err(e) => (
