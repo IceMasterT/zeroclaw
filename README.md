@@ -83,6 +83,12 @@ Fastest path:
 ./scripts/desktop-connect.sh
 ```
 
+If desktop gets unstable (blank screen, stale gateway process, old assets), run:
+
+```bash
+./scripts/desktop-reset.sh
+```
+
 By default this enables **easy-bind** for local desktop use:
 - forces `gateway.host=127.0.0.1`
 - forces `gateway.port=9573`
