@@ -85,7 +85,9 @@ Fastest path:
 
 By default this enables **easy-bind** for local desktop use:
 - forces `gateway.host=127.0.0.1`
+- forces `gateway.port=9573`
 - sets `gateway.require_pairing=false`
+- restarts gateway process to avoid stale/crashy instances
 
 So you will not be prompted for a 6-digit key on localhost.
 

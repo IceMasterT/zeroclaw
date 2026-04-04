@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="${ROOT_DIR}/web"
-DESKTOP_BIN="${WEB_DIR}/src-tauri/target/release/zeroclaw-desktop"
 
 EASY_BIND=1
 PASSTHROUGH_ARGS=()
@@ -58,18 +57,18 @@ fi
 if [[ ${EASY_BIND} -eq 1 ]]; then
   printf 'Desktop easy-bind: enforcing localhost gateway + no pairing key.\n'
   "${ZEROCLAW_BIN}" config set gateway.host 127.0.0.1 >/dev/null
+  "${ZEROCLAW_BIN}" config set gateway.port 9573 >/dev/null
   "${ZEROCLAW_BIN}" config set gateway.require_pairing false >/dev/null
 else
   printf 'Desktop secure-bind: pairing remains enabled.\n'
 fi
 
+# Ensure no stale gateway process is holding old code/state.
+pkill -f "zeroclaw gateway" >/dev/null 2>&1 || true
+
 if [[ ! -d "${WEB_DIR}/node_modules" ]]; then
   printf 'Installing web dependencies...\n'
   npm --prefix "${WEB_DIR}" install
-fi
-
-if [[ -x "${DESKTOP_BIN}" ]]; then
-  exec "${DESKTOP_BIN}" "${PASSTHROUGH_ARGS[@]}"
 fi
 
 exec npm --prefix "${WEB_DIR}" run desktop:fast -- "${PASSTHROUGH_ARGS[@]}"
