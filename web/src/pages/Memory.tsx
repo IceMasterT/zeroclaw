@@ -15,6 +15,12 @@ function truncate(text: string, max: number): string {
   return text.slice(0, max) + '...';
 }
 
+function rowKey(entry: MemoryEntry): string {
+  const id = entry.id?.trim();
+  if (id) return id;
+  return `${entry.key}:${entry.timestamp}:${entry.category}`;
+}
+
 function formatDate(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString();
@@ -38,7 +44,7 @@ export default function Memory() {
 
   const fetchEntries = (q?: string, cat?: string) => {
     setLoading(true);
-    getMemory(q || undefined, cat || undefined)
+    getMemory(q || undefined, cat || undefined, 200)
       .then(setEntries)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
@@ -285,14 +291,14 @@ export default function Memory() {
             <tbody>
               {entries.map((entry) => (
                 <tr
-                  key={entry.id}
+                  key={rowKey(entry)}
                   className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
                 >
                   <td className="px-4 py-3 text-white font-medium font-mono text-xs">
                     {entry.key}
                   </td>
                   <td className="px-4 py-3 text-gray-300 max-w-[300px]">
-                    <span title={entry.content}>
+                    <span title={truncate(entry.content, 500)}>
                       {truncate(entry.content, 80)}
                     </span>
                   </td>

@@ -50,6 +50,16 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    pub limit: Option<usize>,
+}
+
+const DEFAULT_MEMORY_API_LIMIT: usize = 200;
+const MAX_MEMORY_API_LIMIT: usize = 1000;
+
+fn bounded_memory_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_MEMORY_API_LIMIT)
+        .clamp(1, MAX_MEMORY_API_LIMIT)
 }
 
 #[derive(Deserialize)]
@@ -754,10 +764,17 @@ pub async fn handle_api_memory_list(
         return mock_dashboard::memory_list(params.query, params.category);
     }
 
+    let limit = bounded_memory_limit(params.limit);
+
     if let Some(ref query) = params.query {
         // Search mode
-        match state.mem.recall(query, 50, None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+        match state.mem.recall(query, limit, None).await {
+            Ok(mut entries) => {
+                if entries.len() > limit {
+                    entries.truncate(limit);
+                }
+                Json(serde_json::json!({"entries": entries})).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
@@ -774,7 +791,12 @@ pub async fn handle_api_memory_list(
         });
 
         match state.mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(mut entries) => {
+                if entries.len() > limit {
+                    entries.truncate(limit);
+                }
+                Json(serde_json::json!({"entries": entries})).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),

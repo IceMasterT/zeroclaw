@@ -257,10 +257,14 @@ export function runDoctor(): Promise<DiagResult[]> {
 export function getMemory(
   query?: string,
   category?: string,
+  limit = 200,
 ): Promise<MemoryEntry[]> {
   const params = new URLSearchParams();
   if (query) params.set('query', query);
   if (category) params.set('category', category);
+  if (Number.isFinite(limit) && limit > 0) {
+    params.set('limit', String(Math.min(Math.floor(limit), 1000)));
+  }
   const qs = params.toString();
   return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(
     `/api/memory${qs ? `?${qs}` : ''}`,
