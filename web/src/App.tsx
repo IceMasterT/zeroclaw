@@ -14,6 +14,7 @@ import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { coerceLocale, setLocale, type Locale } from './lib/i18n';
+import ErrorBoundary from './components/system/ErrorBoundary';
 
 const LOCALE_STORAGE_KEY = 'zeroclaw:locale';
 
@@ -134,22 +135,24 @@ function AppContent() {
 
   return (
     <LocaleContext.Provider value={{ locale, setAppLocale }}>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/agent" element={<AgentChat />} />
-          <Route path="/tools" element={<Tools />} />
-          <Route path="/cron" element={<Cron />} />
-          <Route path="/integrations" element={<Integrations />} />
-          <Route path="/memory" element={<Memory />} />
-          <Route path="/devices" element={<Devices />} />
-          <Route path="/config" element={<Config />} />
-          <Route path="/cost" element={<Cost />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/doctor" element={<Doctor />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
+      <ErrorBoundary>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/agent" element={<AgentChat />} />
+            <Route path="/tools" element={<Tools />} />
+            <Route path="/cron" element={<Cron />} />
+            <Route path="/integrations" element={<Integrations />} />
+            <Route path="/memory" element={<Memory />} />
+            <Route path="/devices" element={<Devices />} />
+            <Route path="/config" element={<Config />} />
+            <Route path="/cost" element={<Cost />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/doctor" element={<Doctor />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+      </ErrorBoundary>
     </LocaleContext.Provider>
   );
 }
