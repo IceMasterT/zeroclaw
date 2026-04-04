@@ -57,7 +57,13 @@ pub struct MemoryQuery {
 const DEFAULT_MEMORY_API_LIMIT: usize = 200;
 const MAX_MEMORY_API_LIMIT: usize = 1000;
 const MEMORY_API_MAX_KEY_CHARS: usize = 256;
-const MEMORY_API_MAX_CONTENT_CHARS: usize = 4_000;
+const MEMORY_API_MAX_CONTENT_CHARS: usize = 1_200;
+
+fn should_expose_memory_entry_to_dashboard(key: &str) -> bool {
+    // Internal websocket history blobs are large and not actionable in the
+    // dashboard Memory tab; filtering them keeps UI payloads light.
+    !key.starts_with("gateway_ws_history:")
+}
 
 #[derive(Serialize)]
 struct MemoryApiEntry {
@@ -84,6 +90,7 @@ fn sanitize_memory_entries(
 
     entries
         .into_iter()
+        .filter(|entry| should_expose_memory_entry_to_dashboard(&entry.key))
         .map(|entry| {
             let mut id = entry.id;
             if id.trim().is_empty() {
