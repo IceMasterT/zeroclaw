@@ -66,7 +66,7 @@ if (mode === 'lite') {
     riskLine: needsCaution
       ? 'high-impact action detected; require rollback plan + approval'
       : 'validate assumptions before irreversible actions',
-    nextStep: 'ask one uncertainty-reducing question first',
+    nextStep: 'execute the request directly; ask one brief question only if a hard blocker prevents action',
   })
   process.stdout.write(JSON.stringify({ message: overlay }))
   process.exit(0)

@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="${ROOT_DIR}/web"
 
 EASY_BIND=1
+BROWSER_FALLBACK=1
 PASSTHROUGH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -15,15 +16,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --help)
       cat <<'USAGE'
-Usage: ./scripts/desktop-connect.sh [--require-pairing] [-- <desktop args>]
+Usage: ./scripts/desktop-connect.sh [--require-pairing] [--no-browser-fallback] [-- <desktop args>]
 
 Default behavior enables local easy-bind mode:
   - gateway.host = 127.0.0.1
   - gateway.require_pairing = false
 
 Use --require-pairing to keep 6-digit pairing/token auth enabled.
+Use --no-browser-fallback to disable automatic browser fallback if desktop app exits.
 USAGE
       exit 0
+      ;;
+    --no-browser-fallback)
+      BROWSER_FALLBACK=0
+      shift
       ;;
     --)
       shift
@@ -71,4 +77,18 @@ if [[ ! -d "${WEB_DIR}/node_modules" ]]; then
   npm --prefix "${WEB_DIR}" install
 fi
 
-exec npm --prefix "${WEB_DIR}" run desktop:fast -- "${PASSTHROUGH_ARGS[@]}"
+set +e
+npm --prefix "${WEB_DIR}" run desktop:fast -- "${PASSTHROUGH_ARGS[@]}"
+status=$?
+set -e
+
+if [[ ${status} -ne 0 && ${BROWSER_FALLBACK} -eq 1 ]]; then
+  printf 'Desktop app exited unexpectedly (status=%s). Launching browser fallback...\n' "${status}" >&2
+  "${ZEROCLAW_BIN}" gateway --host 127.0.0.1 --port 9573 >/tmp/zeroclaw-gateway-fallback.log 2>&1 &
+  sleep 1
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://127.0.0.1:9573" >/dev/null 2>&1 || true
+  fi
+fi
+
+exit ${status}

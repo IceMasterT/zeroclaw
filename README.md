@@ -83,6 +83,13 @@ Fastest path:
 ./scripts/desktop-connect.sh
 ```
 
+If the native desktop shell exits unexpectedly, the launcher now auto-falls back
+to opening the local gateway in your browser. To disable that behavior:
+
+```bash
+./scripts/desktop-connect.sh --no-browser-fallback
+```
+
 If desktop gets unstable (blank screen, stale gateway process, old assets), run:
 
 ```bash
@@ -211,6 +218,7 @@ max_output_chars = 12000
 Modes:
 
 - `lite`: low-latency safety/epistemic overlay
+- `lite`: low-latency action-first overlay (asks at most one question only when blocked)
 - `full`: richer self-contained analysis mode (still local, no external repo dependency)
 
 ---
