@@ -2,7 +2,18 @@
 set -euo pipefail
 
 HOST="127.0.0.1"
-PORT="9573"
+PORT="${ZEROCLAW_SMOKE_PORT:-}"
+
+if [[ -z "${PORT}" ]]; then
+  PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+fi
 
 if [[ -n "${ZEROCLAW_BIN:-}" ]]; then
   BIN="${ZEROCLAW_BIN}"
@@ -21,6 +32,7 @@ if [[ ! -x "${BIN}" ]]; then
 fi
 
 printf 'Using zeroclaw binary: %s\n' "${BIN}"
+printf 'Smoke target: %s:%s\n' "${HOST}" "${PORT}"
 
 TMP_LOG="/tmp/zeroclaw-desktop-smoke.log"
 

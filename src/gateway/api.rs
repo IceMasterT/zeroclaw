@@ -62,7 +62,8 @@ const MEMORY_API_MAX_CONTENT_CHARS: usize = 1_200;
 fn should_expose_memory_entry_to_dashboard(key: &str) -> bool {
     // Internal websocket history blobs are large and not actionable in the
     // dashboard Memory tab; filtering them keeps UI payloads light.
-    !key.starts_with("gateway_ws_history:")
+    let normalized = key.trim_start();
+    !normalized.starts_with("gateway_ws_history")
 }
 
 #[derive(Serialize)]
