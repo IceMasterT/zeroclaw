@@ -1,265 +1,121 @@
-# ZeroClaw (Aurelion Build)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/IceMasterT/zeroclaw-aurelion/main/Aurelion-Sigil.png" alt="Aurelion Sigil" width="460" />
+</p>
 
-Fast Rust agent runtime with desktop app, personality controls, contemplation bridge, and turbo latency mode.
+<h1 align="center">ZeroClaw Aurelion</h1>
 
-Maintainer profile for this build:
-- Owner: **IceMasterT**
-- Operator: **artiq @ Sanctuary**
-- Branch baseline: `master`
-- Current binary: `zeroclaw 0.1.9`
+<p align="center">
+  Rust-first autonomous runtime with desktop + gateway workflows, memory tooling, and swappable providers/channels/tools.
+</p>
 
----
+<p align="center">
+Built by students and members of the Harvard, MIT, and Sundai. Club communities. Then IceMasterT went absolutely goblin mode on it 💀 bro modded it into oblivion, like OD levels of tweaking. Straight up violated the original code 😭🙏 no cap, maxed out rizz energy fr fr
+</p>
 
-## What Is Included In This Build
+<p align="center">
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/github/contributors/IceMasterT/zeroclaw-aurelion?color=green" alt="Contributors" /></a>
+  <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-hub-0A66C2" alt="Docs Hub" /></a>
+</p>
 
-This repository includes all recent upgrades merged to `master`:
+<p align="center">
+  <strong>Languages:</strong>
+  <a href="README.md">English</a> ·
+  <a href="docs/i18n/zh-CN/README.md">zh-CN</a> ·
+  <a href="docs/i18n/ja/README.md">ja</a> ·
+  <a href="docs/i18n/ru/README.md">ru</a> ·
+  <a href="docs/i18n/fr/README.md">fr</a> ·
+  <a href="docs/i18n/vi/README.md">vi</a> ·
+  <a href="docs/i18n/el/README.md">el</a>
+</p>
 
-- Personality CLI + wizard:
-  - `zeroclaw personality wizard`
-  - `zeroclaw personality show`
-  - `zeroclaw personality profile <name>`
-  - `zeroclaw personality trait <name> <value>`
-- Context-window hardening:
-  - request token budgeting
-  - adaptive context trimming
-  - continuation safeguards
-- Performance upgrades:
-  - adaptive context budgets by model
-  - aggressive retry path on context-overflow failures
-  - tool-output compression in history
-  - bounded enriched prompt assembly
-  - token-aware memory retrieval + short TTL memory context cache
-- Desktop app (Tauri wrapper):
-  - native app shell over ZeroClaw gateway
-  - startup deadlock fix (`--no-dev-server-wait`)
-  - startup lag improvements + existing gateway attach
-  - one-command launcher script
-- Contemplation Core integration:
-  - optional contemplation bridge in agent pipeline
-  - `lite` and `full` bridge modes
-  - low-signal skip optimization to reduce per-turn overhead
-- Turbo mode:
-  - lower-latency loop behavior
-  - reduced loop depth for simple turns
-  - optional tool-schema hiding for low-risk short requests
+## What This Fork Focuses On
 
----
+- Desktop-first runtime and launcher scripts (`web/src-tauri`, `scripts/desktop-connect.sh`)
+- Faster, safer agent loop behavior under heavy context pressure
+- Memory tab crash hardening and payload filtering
+- Local bind quality-of-life defaults for single-machine usage
+- Operational scripts for smoke/reset/debug workflows
 
 ## Quick Start
 
-### 1) Sync local repo
-
 ```bash
-git pull --ff-only origin master
+git clone https://github.com/IceMasterT/zeroclaw-aurelion.git
+cd zeroclaw-aurelion
+cargo build --release --locked
+./target/release/zeroclaw --help
 ```
 
-If your tree is dirty:
+Run gateway + dashboard API:
 
 ```bash
-git stash push -u -m "wip"
-git pull --ff-only origin master
-git stash pop
+./target/release/zeroclaw gateway --host 127.0.0.1 --port 9573
 ```
 
-### 2) Install / refresh binary
+Run desktop launcher flow:
 
 ```bash
-cargo install --path .
+bash scripts/desktop-connect.sh
 ```
 
-### 3) Run agent
+Run smoke validation:
 
 ```bash
-zeroclaw agent -m "hello"
+bash scripts/desktop-smoke.sh
 ```
 
----
+## Optional: GLUV Protocol Bridge
 
-## Desktop App
+You can run GLUV Click Clack (`/media/artiq/DATA/gluv-click-clack`) as an optional MCP server without changing the Rust build.
 
-Fastest path:
+1. Start the bridge process:
 
 ```bash
-./scripts/desktop-connect.sh
+bash scripts/gluv-protocol-bridge.sh
 ```
 
-If the native desktop shell exits unexpectedly, the launcher now auto-falls back
-to opening the local gateway in your browser. To disable that behavior:
-
-```bash
-./scripts/desktop-connect.sh --no-browser-fallback
-```
-
-If desktop gets unstable (blank screen, stale gateway process, old assets), run:
-
-```bash
-./scripts/desktop-reset.sh
-```
-
-By default this enables **easy-bind** for local desktop use:
-- forces `gateway.host=127.0.0.1`
-- forces `gateway.port=9573`
-- sets `gateway.require_pairing=false`
-- restarts gateway process to avoid stale/crashy instances
-
-So you will not be prompted for a 6-digit key on localhost.
-
-If you want strict pairing auth instead:
-
-```bash
-./scripts/desktop-connect.sh --require-pairing
-```
-
-Or re-enable globally:
-
-```bash
-./scripts/desktop-secure-bind.sh
-```
-
-Manual path:
-
-```bash
-cd web
-npm install
-npm run desktop:dev
-```
-
-Release-speed desktop runtime:
-
-```bash
-cd web
-npm run desktop:fast
-```
-
-Build bundles:
-
-```bash
-cd web
-npm run build
-npm run desktop:build
-```
-
----
-
-## Core Commands (What Each Does)
-
-| Command | What it does |
-|---|---|
-| `zeroclaw onboard` | Initializes workspace and base configuration. |
-| `zeroclaw personality` | Configure behavior/personality profiles and traits. |
-| `zeroclaw agent` | Starts interactive/one-shot AI agent loop. |
-| `zeroclaw gateway` | Starts HTTP/WebSocket gateway + dashboard endpoints. |
-| `zeroclaw daemon` | Runs long-lived autonomous runtime (gateway/channels/scheduler). |
-| `zeroclaw service` | Manage OS background service lifecycle. |
-| `zeroclaw doctor` | Runs diagnostics and health checks. |
-| `zeroclaw status` | Shows runtime status overview. |
-| `zeroclaw update` | Self-updates ZeroClaw. |
-| `zeroclaw estop` | Emergency stop controls (engage/resume/check). |
-| `zeroclaw security` | Security maintenance operations. |
-| `zeroclaw cron` | Manage scheduled tasks. |
-| `zeroclaw models` | Manage model catalogs and metadata. |
-| `zeroclaw providers` | List supported AI providers. |
-| `zeroclaw providers-quota` | Show provider quota/rate status. |
-| `zeroclaw channel` | Manage channel connectors and channel runtime actions. |
-| `zeroclaw integrations` | Browse/manage external integrations. |
-| `zeroclaw skill` | Manage skills and skill loading. |
-| `zeroclaw migrate` | Migrate from other agent runtimes. |
-| `zeroclaw auth` | Manage provider auth/subscription profiles. |
-| `zeroclaw hardware` | Detect/introspect connected hardware. |
-| `zeroclaw peripheral` | Manage peripheral runtimes (STM32/RPi/etc). |
-| `zeroclaw memory` | Inspect/clear memory and memory stats. |
-| `zeroclaw config` | Show/get/set config and export schema. |
-| `zeroclaw completions` | Generate shell completions. |
-
-Use help at any level:
-
-```bash
-zeroclaw --help
-zeroclaw <command> --help
-```
-
----
-
-## Performance Profile (Recommended)
-
-Current tuned profile for smooth operation:
-
-- `agent.turbo_mode = true`
-- `agent.turbo_max_tool_iterations = 4`
-- `agent.max_context_tokens = 100000`
-- `agent.max_history_messages = 28`
-- contemplation bridge in `lite` mode with low timeout
-
-To inspect current values:
-
-```bash
-zeroclaw config get agent.turbo_mode
-zeroclaw config get agent.turbo_max_tool_iterations
-zeroclaw config get agent.max_context_tokens
-zeroclaw config get contemplation.command
-```
-
----
-
-## Contemplation Core Bridge
-
-ZeroClaw supports pre-response contemplation via command bridge.
-
-Current default command:
+2. Add this to `~/.zeroclaw/config.toml`:
 
 ```toml
-[contemplation]
+[mcp]
 enabled = true
-command = "CC_BRIDGE_MODE=lite node /home/artiq/zeroclaw/scripts/contemplation-bridge.mjs"
-timeout_ms = 700
-max_output_chars = 12000
+
+[[mcp.servers]]
+name = "gluv"
+transport = "stdio"
+command = "bash"
+args = ["/home/artiq/zeroclaw/scripts/gluv-protocol-bridge.sh"]
+tool_timeout_secs = 60
 ```
 
-Modes:
+3. Restart ZeroClaw and verify MCP tools are loaded in your session.
 
-- `lite`: low-latency safety/epistemic overlay
-- `lite`: low-latency action-first overlay (asks at most one question only when blocked)
-- `full`: richer self-contained analysis mode (still local, no external repo dependency)
-
----
-
-## Troubleshooting
-
-### "Loop pattern detected"
-
-Raise thresholds moderately:
+## Personality Commands
 
 ```bash
-zeroclaw config set agent.loop_detection_no_progress_threshold 6
-zeroclaw config set agent.loop_detection_ping_pong_cycles 4
-zeroclaw config set agent.loop_detection_failure_streak 6
+zeroclaw personality wizard
+zeroclaw personality show
+zeroclaw personality profile balanced
+zeroclaw personality trait curiosity 0.70
 ```
 
-### Slow startup / lag spikes
+## Docs
 
-- Run `zeroclaw doctor`
-- Ensure disk has healthy free space
-- Clear heavy build artifacts when needed (`target/`, tauri targets)
-- Keep skills directory lean if startup logs are noisy
+- Docs hub: `docs/README.md`
+- Full TOC: `docs/SUMMARY.md`
+- Operations: `docs/operations/README.md`
+- Security: `docs/security/README.md`
+- Troubleshooting: `docs/troubleshooting.md`
 
-### Desktop can’t connect to `127.0.0.1`
+## Credit
 
-Use:
-
-```bash
-./scripts/desktop-connect.sh
-```
-
-or verify gateway manually:
-
-```bash
-zeroclaw gateway --host 127.0.0.1 --port 9573
-```
-
----
+This project builds on major work from the original ZeroClaw community and the student/member contributors from Harvard, MIT, and Sundai club ecosystems. This fork continues that foundation with additional runtime, UX, and operations changes.
 
 ## License
 
-Dual licensed:
+Dual licensed under:
+
 - MIT (`LICENSE-MIT`)
-- Apache-2.0 (`LICENSE-APACHE`)
+- Apache 2.0 (`LICENSE-APACHE`)
+
+You may choose either license.
