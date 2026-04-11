@@ -4,6 +4,7 @@ pub enum MemoryBackendKind {
     SqliteQdrantHybrid,
     Lucid,
     CortexMem,
+    Mempalace,
     Postgres,
     Qdrant,
     Markdown,
@@ -43,6 +44,15 @@ const LUCID_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const CORTEX_MEM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "cortex-mem",
     label: "Cortex-Mem bridge — optional CLI sync with local SQLite fallback",
+    auto_save_default: true,
+    uses_sqlite_hygiene: true,
+    sqlite_based: true,
+    optional_dependency: true,
+};
+
+const MEMPALACE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "mempalace",
+    label: "MemPalace bridge — local SQLite with optional MemPalace semantic recall",
     auto_save_default: true,
     uses_sqlite_hygiene: true,
     sqlite_based: true,
@@ -103,11 +113,12 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
-const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 6] = [
+const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 7] = [
     SQLITE_PROFILE,
     SQLITE_QDRANT_HYBRID_PROFILE,
     LUCID_PROFILE,
     CORTEX_MEM_PROFILE,
+    MEMPALACE_PROFILE,
     MARKDOWN_PROFILE,
     NONE_PROFILE,
 ];
@@ -126,6 +137,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite_qdrant_hybrid" | "hybrid" => MemoryBackendKind::SqliteQdrantHybrid,
         "lucid" => MemoryBackendKind::Lucid,
         "cortex-mem" | "cortex_mem" | "cortexmem" | "cortex" => MemoryBackendKind::CortexMem,
+        "mempalace" | "mem-palace" | "mem_palace" => MemoryBackendKind::Mempalace,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
@@ -140,6 +152,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::SqliteQdrantHybrid => SQLITE_QDRANT_HYBRID_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::CortexMem => CORTEX_MEM_PROFILE,
+        MemoryBackendKind::Mempalace => MEMPALACE_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
@@ -169,6 +182,10 @@ mod tests {
             MemoryBackendKind::CortexMem
         );
         assert_eq!(
+            classify_memory_backend("mempalace"),
+            MemoryBackendKind::Mempalace
+        );
+        assert_eq!(
             classify_memory_backend("postgres"),
             MemoryBackendKind::Postgres
         );
@@ -195,13 +212,14 @@ mod tests {
     #[test]
     fn selectable_backends_are_ordered_for_onboarding() {
         let backends = selectable_memory_backends();
-        assert_eq!(backends.len(), 6);
+        assert_eq!(backends.len(), 7);
         assert_eq!(backends[0].key, "sqlite");
         assert_eq!(backends[1].key, "sqlite_qdrant_hybrid");
         assert_eq!(backends[2].key, "lucid");
         assert_eq!(backends[3].key, "cortex-mem");
-        assert_eq!(backends[4].key, "markdown");
-        assert_eq!(backends[5].key, "none");
+        assert_eq!(backends[4].key, "mempalace");
+        assert_eq!(backends[5].key, "markdown");
+        assert_eq!(backends[6].key, "none");
     }
 
     #[test]

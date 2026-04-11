@@ -8,6 +8,7 @@ pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
+pub mod mempalace;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
@@ -28,6 +29,7 @@ pub use cortex::CortexMemMemory;
 pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+pub use mempalace::MempalaceMemory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
@@ -65,6 +67,10 @@ where
         MemoryBackendKind::CortexMem => {
             let local = sqlite_builder()?;
             Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
+        }
+        MemoryBackendKind::Mempalace => {
+            let local = sqlite_builder()?;
+            Ok(Box::new(MempalaceMemory::new(local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
@@ -226,6 +232,7 @@ pub fn create_memory_with_storage_and_routes(
                 | MemoryBackendKind::SqliteQdrantHybrid
                 | MemoryBackendKind::Lucid
                 | MemoryBackendKind::CortexMem
+                | MemoryBackendKind::Mempalace
         )
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
@@ -242,6 +249,7 @@ pub fn create_memory_with_storage_and_routes(
                 | MemoryBackendKind::SqliteQdrantHybrid
                 | MemoryBackendKind::Lucid
                 | MemoryBackendKind::CortexMem
+                | MemoryBackendKind::Mempalace
         )
         && snapshot::should_hydrate(workspace_dir)
     {
@@ -391,7 +399,7 @@ pub fn create_memory_for_migration(
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, cortex-mem, or markdown before migration"
+            "memory backend 'none' disables persistence; choose sqlite, lucid, cortex-mem, mempalace, or markdown before migration"
         );
     }
 
@@ -474,6 +482,17 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
+    }
+
+    #[test]
+    fn factory_mempalace() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "mempalace".into(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "mempalace");
     }
 
     #[test]
