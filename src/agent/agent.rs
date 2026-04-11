@@ -426,7 +426,17 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
+            let mut drop_count = other_messages.len() - max;
+
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+
             other_messages.drain(0..drop_count);
         }
 
@@ -1075,6 +1085,68 @@ mod tests {
             .history()
             .iter()
             .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+    }
+
+    #[test]
+    fn trim_history_does_not_start_with_orphan_tool_results() {
+        use crate::providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut agent_config = crate::config::AgentConfig::default();
+        agent_config.max_history_messages = 4;
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        for i in 1..=3 {
+            agent.history.push(ConversationMessage::AssistantToolCalls {
+                text: Some(format!("Calling tool {i}")),
+                tool_calls: vec![ToolCall {
+                    id: format!("tc{i}"),
+                    name: format!("tool{i}"),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: None,
+            });
+
+            if i < 3 {
+                agent
+                    .history
+                    .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: format!("tc{i}"),
+                        content: format!("result{i}"),
+                    }]));
+            }
+        }
+
+        assert_eq!(agent.history.len(), 5);
+        agent.trim_history();
+
+        if let Some(first) = agent.history.first() {
+            assert!(
+                !matches!(first, ConversationMessage::ToolResults(_)),
+                "trim_history left orphan ToolResults at history head"
+            );
+        }
     }
 
     #[tokio::test]
