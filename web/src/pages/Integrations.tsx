@@ -49,31 +49,42 @@ const SELECT_KEEP = '__keep__';
 const SELECT_CUSTOM = '__custom__';
 const SELECT_CLEAR = '__clear__';
 
+const UPDATED_CHAT_MODELS = [
+  'openrouter/elephant-alpha',
+  'google/gemma-4-26b-a4b-it:free',
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-nano-9b-v2:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'nvidia/nemotron-3-nano-30b-a3b:free',
+  'nvidia/nemotron-nano-12b-v2-vl:free',
+  'minimax/minimax-m2.5:free',
+  'liquid/lfm-2.5-1.2b-thinking:free',
+  'liquid/lfm-2.5-1.2b-instruct:free',
+  'openai/gpt-oss-120b:free',
+  'openai/gpt-oss-20b:free',
+];
+
 const FALLBACK_MODEL_OPTIONS: Record<string, string[]> = {
-  openrouter: ['anthropic/claude-sonnet-4-6', 'openai/gpt-5.2', 'google/gemini-3.1-pro'],
-  anthropic: ['claude-sonnet-4-6', 'claude-opus-4-6'],
-  openai: ['gpt-5.2', 'gpt-5.2-codex', 'gpt-4o'],
-  google: ['google/gemini-3.1-pro', 'google/gemini-3-flash', 'google/gemini-2.5-pro'],
-  deepseek: ['deepseek/deepseek-reasoner', 'deepseek/deepseek-chat'],
-  xai: ['x-ai/grok-4', 'x-ai/grok-3'],
-  mistral: ['mistral-large-latest', 'codestral-latest', 'mistral-small-latest'],
-  perplexity: ['sonar-pro', 'sonar-reasoning-pro', 'sonar'],
-  vercel: ['openai/gpt-5.2', 'anthropic/claude-sonnet-4-6', 'google/gemini-3.1-pro'],
-  bedrock: ['anthropic.claude-sonnet-4-5-20250929-v1:0', 'anthropic.claude-opus-4-6-v1:0'],
-  groq: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],
-  together: [
-    'meta-llama/Llama-3.3-70B-Instruct-Turbo',
-    'Qwen/Qwen2.5-72B-Instruct-Turbo',
-    'deepseek-ai/DeepSeek-R1-Distill-Llama-70B',
-  ],
-  cohere: ['command-r-plus-08-2024', 'command-r-08-2024'],
+  openrouter: UPDATED_CHAT_MODELS,
+  anthropic: UPDATED_CHAT_MODELS,
+  openai: UPDATED_CHAT_MODELS,
+  google: UPDATED_CHAT_MODELS,
+  deepseek: UPDATED_CHAT_MODELS,
+  xai: UPDATED_CHAT_MODELS,
+  mistral: UPDATED_CHAT_MODELS,
+  perplexity: UPDATED_CHAT_MODELS,
+  vercel: UPDATED_CHAT_MODELS,
+  bedrock: UPDATED_CHAT_MODELS,
+  groq: UPDATED_CHAT_MODELS,
+  together: UPDATED_CHAT_MODELS,
+  cohere: UPDATED_CHAT_MODELS,
 };
 
 function customModelFormatHint(integrationId: string): string {
   if (integrationId === 'openrouter' || integrationId === 'vercel') {
-    return 'Format: anthropic/claude-sonnet-4-6';
+    return 'Format: openrouter/elephant-alpha';
   }
-  return 'Format: claude-sonnet-4-6 (or provider/model when required)';
+  return 'Format: provider/model (e.g. openrouter/elephant-alpha)';
 }
 
 function modelOptionsForField(
